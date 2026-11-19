@@ -5,7 +5,7 @@ const pool = require("./pool");
 const crypto = require("crypto");
 
 // ======================================================
-// WAREHOUSE ROUTER CONNECTION TEST
+// ROUTER TEST
 // GET /api/seller-warehouses/test
 // ======================================================
 
@@ -17,20 +17,29 @@ router.get("/test", (req, res) => {
   });
 });
 
-
 // ======================================================
 // SELLER AUTHENTICATION
-// Same authentication as existing seller login
 // ======================================================
 
 function getBearerToken(req) {
   const header = req.headers.authorization || "";
-  const match = header.match(/^Bearer\s+([a-f0-9]{64})$/i);
-  return match ? match[1] : null;
+
+  const match = header.match(/^Bearer\s+(.+)$/i);
+
+  if (!match) return null;
+
+  const token = match[1].trim();
+
+  if (!token || token.length > 500) return null;
+
+  return token;
 }
 
 function hashSessionToken(token) {
-  return crypto.createHash("sha256").update(token).digest("hex");
+  return crypto
+    .createHash("sha256")
+    .update(token)
+    .digest("hex");
 }
 
 async function authenticateSeller(req, res, next) {
@@ -41,7 +50,7 @@ async function authenticateSeller(req, res, next) {
       return res.status(401).json({
         success: false,
         status: false,
-        message: "Please log in to continue.",
+        message: "Seller login token missing.",
       });
     }
 
@@ -61,14 +70,15 @@ async function authenticateSeller(req, res, next) {
       return res.status(401).json({
         success: false,
         status: false,
-        message: "Session expired. Please log in again.",
+        message: "Invalid or expired seller session. Please login again.",
       });
     }
 
     req.sellerId = sessions[0].seller_id;
     req.sessionId = sessions[0].id;
 
-    next();
+    return next();
+
   } catch (error) {
     console.error("WAREHOUSE AUTH ERROR:", error);
 
@@ -262,6 +272,7 @@ router.get("/", authenticateSeller, async (req, res) => {
       count: rows.length,
       warehouses: rows,
     });
+
   } catch (error) {
     console.error("FETCH WAREHOUSES ERROR:", error);
 
@@ -269,13 +280,13 @@ router.get("/", authenticateSeller, async (req, res) => {
       success: false,
       status: false,
       message: "Unable to fetch warehouses.",
+      error: error.message,
     });
   }
 });
 
 // ======================================================
 // GET SINGLE WAREHOUSE
-// GET /api/seller-warehouses/:id
 // ======================================================
 
 router.get("/:id", authenticateSeller, async (req, res) => {
@@ -311,6 +322,7 @@ router.get("/:id", authenticateSeller, async (req, res) => {
       status: true,
       warehouse: rows[0],
     });
+
   } catch (error) {
     console.error("FETCH SINGLE WAREHOUSE ERROR:", error);
 
@@ -324,7 +336,6 @@ router.get("/:id", authenticateSeller, async (req, res) => {
 
 // ======================================================
 // ADD WAREHOUSE
-// POST /api/seller-warehouses
 // ======================================================
 
 router.post("/", authenticateSeller, async (req, res) => {
@@ -346,11 +357,12 @@ router.post("/", authenticateSeller, async (req, res) => {
     connection = await pool.getConnection();
     await connection.beginTransaction();
 
-    // Lock seller row before changing default warehouse.
     const [seller] = await connection.query(
-      `SELECT id FROM sellers
+      `SELECT id
+       FROM sellers
        WHERE id = ?
-       LIMIT 1 FOR UPDATE`,
+       LIMIT 1
+       FOR UPDATE`,
       [req.sellerId]
     );
 
@@ -399,6 +411,7 @@ router.post("/", authenticateSeller, async (req, res) => {
       message: "Warehouse added successfully.",
       warehouse: created[0],
     });
+
   } catch (error) {
     if (connection) await connection.rollback();
 
@@ -408,7 +421,9 @@ router.post("/", authenticateSeller, async (req, res) => {
       success: false,
       status: false,
       message: "Unable to add warehouse.",
+      error: error.message,
     });
+
   } finally {
     if (connection) connection.release();
   }
@@ -416,7 +431,6 @@ router.post("/", authenticateSeller, async (req, res) => {
 
 // ======================================================
 // UPDATE WAREHOUSE
-// PUT /api/seller-warehouses/:id
 // ======================================================
 
 router.put("/:id", authenticateSeller, async (req, res) => {
@@ -449,9 +463,11 @@ router.put("/:id", authenticateSeller, async (req, res) => {
     await connection.beginTransaction();
 
     await connection.query(
-      `SELECT id FROM sellers
+      `SELECT id
+       FROM sellers
        WHERE id = ?
-       LIMIT 1 FOR UPDATE`,
+       LIMIT 1
+       FOR UPDATE`,
       [req.sellerId]
     );
 
@@ -459,7 +475,8 @@ router.put("/:id", authenticateSeller, async (req, res) => {
       `SELECT id
        FROM seller_warehouses
        WHERE id = ? AND seller_id = ?
-       LIMIT 1 FOR UPDATE`,
+       LIMIT 1
+       FOR UPDATE`,
       [warehouseId, req.sellerId]
     );
 
@@ -490,11 +507,7 @@ router.put("/:id", authenticateSeller, async (req, res) => {
       `UPDATE seller_warehouses
        SET ${setClause}
        WHERE id = ? AND seller_id = ?`,
-      [
-        ...warehouseValues(data),
-        warehouseId,
-        req.sellerId,
-      ]
+      [...warehouseValues(data), warehouseId, req.sellerId]
     );
 
     await connection.commit();
@@ -513,6 +526,7 @@ router.put("/:id", authenticateSeller, async (req, res) => {
       message: "Warehouse updated successfully.",
       warehouse: updated[0],
     });
+
   } catch (error) {
     if (connection) await connection.rollback();
 
@@ -522,7 +536,9 @@ router.put("/:id", authenticateSeller, async (req, res) => {
       success: false,
       status: false,
       message: "Unable to update warehouse.",
+      error: error.message,
     });
+
   } finally {
     if (connection) connection.release();
   }
@@ -530,7 +546,6 @@ router.put("/:id", authenticateSeller, async (req, res) => {
 
 // ======================================================
 // DELETE WAREHOUSE
-// DELETE /api/seller-warehouses/:id
 // ======================================================
 
 router.delete("/:id", authenticateSeller, async (req, res) => {
@@ -565,6 +580,7 @@ router.delete("/:id", authenticateSeller, async (req, res) => {
       message: "Warehouse deleted successfully.",
       warehouseId,
     });
+
   } catch (error) {
     console.error("DELETE WAREHOUSE ERROR:", error);
 
@@ -572,6 +588,7 @@ router.delete("/:id", authenticateSeller, async (req, res) => {
       success: false,
       status: false,
       message: "Unable to delete warehouse.",
+      error: error.message,
     });
   }
 });
