@@ -1010,6 +1010,7 @@ router.get("/my-packages", authenticateSeller, async (req, res) => {
 // (national / international / website).
 // ------------------------------------------------------
 
+
 async function getPackageCharge(db, sellerId, plan, lock = false) {
   const planTotal = money(plan.total_amount);
 
@@ -1040,7 +1041,9 @@ async function getPackageCharge(db, sellerId, plan, lock = false) {
   let state = "buy";
 
   if (current) {
-    if (String(current.package_id) === String(plan.package_id)) {
+    if (
+      String(current.package_id) === String(plan.package_id)
+    ) {
       state = "current";
     } else if (planTotal <= credit) {
       state = "lower";
@@ -1049,16 +1052,25 @@ async function getPackageCharge(db, sellerId, plan, lock = false) {
     }
   }
 
-  // Full plan price is always deducted from the wallet.
-  const charge = planTotal;
+  const charge = current
+    ? money(Math.max(planTotal - credit, 0))
+    : planTotal;
 
-  return { current, planTotal, credit, charge, state };
+  return {
+    current,
+    planTotal,
+    credit,
+    charge,
+    state,
+  };
 }
+
 
 // ======================================================
 // QUOTES (price this seller will actually pay per plan)
 // GET /api/payment/package/quotes?type=national
 // ======================================================
+
 
 router.get("/package/quotes", authenticateSeller, async (req, res) => {
   try {
@@ -1072,9 +1084,15 @@ router.get("/package/quotes", authenticateSeller, async (req, res) => {
     }
 
     const [plans] = await pool.query(
-      `SELECT id, package_id, package_type, plan_name, total_amount
+      `SELECT
+         id,
+         package_id,
+         package_type,
+         plan_name,
+         total_amount
        FROM seller_package_plans
-       WHERE package_type = ? AND status = 'active'
+       WHERE package_type = ?
+         AND status = 'active'
        ORDER BY sort_order ASC, id ASC`,
       [type]
     );
@@ -1089,23 +1107,28 @@ router.get("/package/quotes", authenticateSeller, async (req, res) => {
     );
 
     const balance = money(walletRows[0]?.balance || 0);
-
     const quotes = [];
 
     for (const plan of plans) {
-      const q = await getPackageCharge(pool, req.sellerId, plan, false);
+      const q = await getPackageCharge(
+        pool,
+        req.sellerId,
+        plan,
+        false
+      );
 
       quotes.push({
         package_id: plan.package_id,
         plan_key: slug(plan.plan_name),
         plan_name: plan.plan_name,
-        state: q.state, // buy | upgrade | current | lower
+        state: q.state,
         plan_total: q.planTotal,
         credit: q.credit,
         charge: q.charge,
-        shortfall: q.state === "buy" || q.state === "upgrade"
-          ? money(Math.max(q.charge - balance, 0))
-          : 0,
+        shortfall:
+          q.state === "buy" || q.state === "upgrade"
+            ? money(Math.max(q.charge - balance, 0))
+            : 0,
       });
     }
 
@@ -1131,6 +1154,7 @@ router.get("/package/quotes", authenticateSeller, async (req, res) => {
 // body: { type, planId }
 // ======================================================
 
+
 router.post(
   "/package/purchase-with-wallet",
   authenticateSeller,
@@ -1141,29 +1165,23 @@ router.post(
       const type = clean(req.body?.type).toLowerCase();
       const planId = clean(req.body?.planId);
 
-      const plan = await findPackagePlan(type, planId);
-
-      if (!plan) {
-        return res.status(404).json({
-          success: false,
-          message: "Selected package was not found or is inactive.",
-        });
-      }
-
-      if (money(plan.total_amount) <= 0) {
+      if (!TYPE_TITLES[type] || !planId) {
         return res.status(400).json({
           success: false,
-          message: "Invalid package amount in database.",
+          message: "Valid package type and plan are required.",
         });
       }
 
       connection = await pool.getConnection();
       await connection.beginTransaction();
 
-      // Seller row lock: stops double-click / parallel requests
-      // from charging twice.
+      // Lock seller row to prevent simultaneous purchases.
       const [sellerRows] = await connection.query(
-        `SELECT id FROM sellers WHERE id = ? LIMIT 1 FOR UPDATE`,
+        `SELECT id
+         FROM sellers
+         WHERE id = ?
+         LIMIT 1
+         FOR UPDATE`,
         [req.sellerId]
       );
 
@@ -1176,6 +1194,51 @@ router.post(
         });
       }
 
+      // Fetch selected active plan.
+      const normalizedPlanId = slug(planId);
+
+      const [planRows] = await connection.query(
+        `SELECT
+           id,
+           package_id,
+           package_type,
+           plan_name,
+           total_amount
+         FROM seller_package_plans
+         WHERE package_type = ?
+           AND status = 'active'
+         ORDER BY sort_order ASC, id ASC`,
+        [type]
+      );
+
+      const plan = planRows.find(
+        (row) =>
+          slug(row.package_id) === normalizedPlanId ||
+          slug(row.plan_name) === normalizedPlanId ||
+          slug(`${type}_${row.plan_name}`) === normalizedPlanId
+      );
+
+      if (!plan) {
+        await connection.rollback();
+
+        return res.status(404).json({
+          success: false,
+          message: "Selected package was not found or is inactive.",
+        });
+      }
+
+      const planTotal = money(plan.total_amount);
+
+      if (planTotal <= 0) {
+        await connection.rollback();
+
+        return res.status(400).json({
+          success: false,
+          message: "Invalid package amount.",
+        });
+      }
+
+      // Calculate the actual amount payable.
       const quote = await getPackageCharge(
         connection,
         req.sellerId,
@@ -1188,23 +1251,20 @@ router.post(
 
         return res.status(409).json({
           success: false,
-          message: "This plan is already active on your account.",
+          message: "This package is already active.",
         });
       }
 
-      if (quote.state === "lower") {
+      if (quote.state === "lower" || quote.charge <= 0) {
         await connection.rollback();
 
         return res.status(400).json({
           success: false,
-          message:
-            "You cannot switch to a lower or equal plan while your current plan is active.",
+          message: "You cannot downgrade to a lower or equal package.",
         });
       }
 
-      const charge = quote.charge;
-
-      // Lock wallet row.
+      // Lock wallet.
       const [walletRows] = await connection.query(
         `SELECT id, balance, status
          FROM seller_wallet
@@ -1217,7 +1277,20 @@ router.post(
 
       const wallet = walletRows[0];
 
-      if (wallet && wallet.status === "blocked") {
+      if (!wallet || wallet.status !== "active") {
+        await connection.rollback();
+
+        return res.status(402).json({
+          success: false,
+          code: "INSUFFICIENT_BALANCE",
+          message: "Please recharge your wallet before purchasing a package.",
+          required: quote.charge,
+          balance: money(wallet?.balance || 0),
+          shortfall: quote.charge,
+        });
+      }
+
+      if (wallet.status === "blocked") {
         await connection.rollback();
 
         return res.status(403).json({
@@ -1226,9 +1299,10 @@ router.post(
         });
       }
 
-      const before = money(wallet?.balance || 0);
+      const before = money(wallet.balance);
+      const charge = money(quote.charge);
 
-      if (!wallet || before < charge) {
+      if (before < charge) {
         await connection.rollback();
 
         return res.status(402).json({
@@ -1242,9 +1316,13 @@ router.post(
       }
 
       const after = money(before - charge);
-      const packageName = `${TYPE_TITLES[plan.package_type]} - ${plan.plan_name}`;
+      const packageName =
+        `${TYPE_TITLES[type]} - ${plan.plan_name}`;
 
-      // 1. Payment record (gateway = wallet)
+      const orderReference =
+        `WALLET_${req.sellerId}_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
+
+      // 1. Record package payment.
       const [paymentResult] = await connection.query(
         `INSERT INTO seller_payments
           (
@@ -1264,19 +1342,21 @@ router.post(
           plan.package_id,
           packageName,
           charge,
-          `WALLET_${Date.now()}_${req.sellerId}`,
+          orderReference,
         ]
       );
 
       const paymentRecordId = paymentResult.insertId;
 
-      // 2. Deduct wallet
+      // 2. Deduct wallet balance.
       await connection.query(
-        `UPDATE seller_wallet SET balance = ? WHERE id = ?`,
+        `UPDATE seller_wallet
+         SET balance = ?
+         WHERE id = ?`,
         [after, wallet.id]
       );
 
-      // 3. Passbook entry (debit)
+      // 3. Insert exactly one debit passbook transaction.
       const reason =
         quote.state === "upgrade"
           ? `Package Upgrade: ${packageName}`
@@ -1309,18 +1389,18 @@ router.post(
         ]
       );
 
-      // 4. Replace old plan of the SAME type
+      // 4. Cancel previous active plan of the same type.
       await connection.query(
         `UPDATE seller_package_subscriptions
          SET status = 'cancelled'
          WHERE seller_id = ?
            AND package_type = ?
            AND status = 'active'`,
-        [req.sellerId, plan.package_type]
+        [req.sellerId, type]
       );
 
-      // 5. Activate new plan: purchase date = now, expiry = +365 days
-      const [subResult] = await connection.query(
+      // 5. Activate new package.
+      const [subscriptionResult] = await connection.query(
         `INSERT INTO seller_package_subscriptions
           (
             seller_id,
@@ -1341,18 +1421,26 @@ router.post(
           req.sellerId,
           plan.package_id,
           packageName,
-          plan.package_type,
+          type,
           paymentRecordId,
           PACKAGE_VALIDITY_DAYS,
         ]
       );
 
-      const [subRows] = await connection.query(
-        `SELECT id, package_id, package_name, package_type, status,
-                starts_at, expires_at
+      const [subscriptionRows] = await connection.query(
+        `SELECT
+           id,
+           package_id,
+           package_name,
+           package_type,
+           payment_record_id,
+           status,
+           starts_at,
+           expires_at
          FROM seller_package_subscriptions
-         WHERE id = ?`,
-        [subResult.insertId]
+         WHERE id = ?
+         LIMIT 1`,
+        [subscriptionResult.insertId]
       );
 
       await connection.commit();
@@ -1364,9 +1452,11 @@ router.post(
             ? "Package upgraded successfully."
             : "Package activated successfully.",
         charged: charge,
-                balance_before: before,
+        plan_total: quote.planTotal,
+        previous_paid: quote.credit,
+        balance_before: before,
         balance_after: after,
-        package: subRows[0],
+        package: subscriptionRows[0],
       });
     } catch (error) {
       if (connection) {
@@ -1388,6 +1478,7 @@ router.post(
     }
   }
 );
+
 
 // ======================================================
 // FEATURE GATING FOR SELLER PANEL ROUTES
