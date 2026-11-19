@@ -1,0 +1,177 @@
+/* =========================================================
+   sellerApi.js — shared helper for seller pages
+   Usage:
+     import { sellerApi } from "./sellerApi";
+     const data = await sellerApi("/my-packages");
+========================================================= */
+
+export const API = "https://api-backend.dropshy.in/api/sellers";
+
+const SELLER_TOKEN_KEYS = [
+  "dropshy_seller_token",
+  "sellerToken",
+  "seller_token",
+  "SELLER_TOKEN",
+  "token",
+  "accessToken",
+  "access_token",
+  "authToken",
+  "sellerAuthToken",
+];
+
+const SELLER_DATA_KEYS = [
+  "dropshy_seller",
+  "SELLER_DATA",
+  "SELLER",
+  "seller",
+  "sellerData",
+];
+
+function extractSellerToken(value, depth = 0) {
+  if (!value || depth > 4) return null;
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+
+    if (!trimmed || trimmed === "null" || trimmed === "undefined") {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed);
+
+      if (parsed && typeof parsed === "object") {
+        return extractSellerToken(parsed, depth + 1);
+      }
+    } catch {
+      return trimmed;
+    }
+
+    return null;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const token = extractSellerToken(item, depth + 1);
+      if (token) return token;
+    }
+
+    return null;
+  }
+
+  if (typeof value === "object") {
+    const directTokenKeys = [
+      "token",
+      "sellerToken",
+      "seller_token",
+      "accessToken",
+      "access_token",
+      "authToken",
+      "auth_token",
+      "jwt",
+    ];
+
+    for (const key of directTokenKeys) {
+      const candidate = value[key];
+
+      if (typeof candidate === "string" && candidate.trim()) {
+        return candidate.trim();
+      }
+    }
+
+    for (const key of ["data", "user", "seller", "profile", "auth"]) {
+      if (value[key] && typeof value[key] === "object") {
+        const token = extractSellerToken(value[key], depth + 1);
+
+        if (token) return token;
+      }
+    }
+  }
+
+  return null;
+}
+
+export function getSellerToken() {
+  if (typeof window === "undefined") return null;
+
+  const storages = [window.localStorage, window.sessionStorage];
+
+  for (const storage of storages) {
+    for (const key of [...SELLER_TOKEN_KEYS, ...SELLER_DATA_KEYS]) {
+      try {
+        const token = extractSellerToken(storage.getItem(key));
+        if (token) return token;
+      } catch {
+        // ignore storage read errors
+      }
+    }
+  }
+
+  for (const storage of storages) {
+    try {
+      for (let i = 0; i < storage.length; i += 1) {
+        const key = storage.key(i);
+
+        if (!key || !key.toLowerCase().includes("seller")) continue;
+
+        const token = extractSellerToken(storage.getItem(key));
+        if (token) return token;
+      }
+    } catch {
+      // ignore storage scan errors
+    }
+  }
+
+  return null;
+}
+
+export async function sellerApi(path, options = {}) {
+  const token = getSellerToken();
+
+  if (!token) {
+    throw new Error(
+      "Seller login token nahi mila. Please seller account se logout karke dobara login karein."
+    );
+  }
+
+  const headers = {
+    ...(options.headers || {}),
+    Authorization: `Bearer ${token}`,
+  };
+
+  const isFormData =
+    typeof FormData !== "undefined" && options.body instanceof FormData;
+
+  if (!isFormData && !headers["Content-Type"]) {
+    headers["Content-Type"] = "application/json";
+  }
+
+  const res = await fetch(`${API}${path}`, {
+    ...options,
+    headers,
+    credentials: "include",
+  });
+
+  let data = {};
+
+  try {
+    data = await res.json();
+  } catch {
+    // non-JSON response
+  }
+
+  if (res.status === 401) {
+    throw new Error(
+      data.message ||
+        "Seller login session invalid ya expire ho gaya hai. Please dobara login karein."
+    );
+  }
+
+  if (!res.ok || data.success === false) {
+    throw new Error(
+      data.message || `Request failed. Server status: ${res.status}`
+    );
+  }
+
+  return data;
+}
