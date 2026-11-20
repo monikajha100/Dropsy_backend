@@ -4,7 +4,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
-
+const { ensureInvoice } = require("./invoiceService");
 const app = express();
 
 // ======================================================
@@ -117,7 +117,7 @@ app.use("/api/gst-ledger", require("./src/routes/gstLedger"));
 
 // Categories
 app.use("/api/categories", require("./src/routes/categories"));
-
+app.use("/api/invoiceServices", require("./src/routes/invoiceService"));
 // Support Tickets
 app.use("/api/tickets", require("./src/routes/tickets"));
 app.use("/api/seller-warehouses",require("./src/routes/sellerWarehouses"));

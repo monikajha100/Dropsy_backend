@@ -1277,27 +1277,62 @@ router.post(
 
       const wallet = walletRows[0];
 
-      if (!wallet || wallet.status !== "active") {
-        await connection.rollback();
+      if (!wallet) {
+  await connection.rollback();
 
-        return res.status(402).json({
-          success: false,
-          code: "INSUFFICIENT_BALANCE",
-          message: "Please recharge your wallet before purchasing a package.",
-          required: quote.charge,
-          balance: money(wallet?.balance || 0),
-          shortfall: quote.charge,
-        });
-      }
+  return res.status(402).json({
+    success: false,
+    code: "INSUFFICIENT_BALANCE",
+    message: "Please recharge your wallet before purchasing a package.",
+    required: quote.charge,
+    balance: 0,
+    shortfall: quote.charge,
+  });
+}
 
-      if (wallet.status === "blocked") {
-        await connection.rollback();
+if (wallet.status === "blocked") {
+  await connection.rollback();
 
-        return res.status(403).json({
-          success: false,
-          message: "Your wallet is blocked. Please contact support.",
-        });
-      }
+  return res.status(403).json({
+    success: false,
+    message: "Your wallet is blocked. Please contact support.",
+  });
+}
+
+if (!wallet) {
+  await connection.rollback();
+
+  return res.status(402).json({
+    success: false,
+    code: "INSUFFICIENT_BALANCE",
+    message: "Please recharge your wallet before purchasing a package.",
+    required: quote.charge,
+    balance: 0,
+    shortfall: quote.charge,
+  });
+}
+
+if (wallet.status === "blocked") {
+  await connection.rollback();
+
+  return res.status(403).json({
+    success: false,
+    message: "Your wallet is blocked. Please contact support.",
+  });
+}
+
+if (wallet.status !== "active") {
+  await connection.rollback();
+
+  return res.status(402).json({
+    success: false,
+    code: "INSUFFICIENT_BALANCE",
+    message: "Your wallet is inactive. Please recharge your wallet.",
+    required: quote.charge,
+    balance: money(wallet.balance),
+    shortfall: quote.charge,
+  });
+}
 
       const before = money(wallet.balance);
       const charge = money(quote.charge);
@@ -2387,9 +2422,100 @@ router.post(
     }
   }
 );
+// ======================================================
+// ADMIN - ALL SELLER PACKAGE PURCHASE HISTORY
+// GET /api/payment/admin/package-history
+// ======================================================
 
+router.get(
+  "/admin/package-history",
+  authenticateAdmin,
+  async (req, res) => {
+    try {
+      const [rows] = await pool.query(`
+        SELECT
+          sp.id AS subscription_id,
+          sp.seller_id,
+          s.fullName AS seller_name,
+          s.email AS seller_email,
+          s.mobile AS seller_mobile,
+          s.enrollmentNumber,
+
+          sp.package_id,
+          sp.package_name,
+          sp.package_type,
+          sp.status AS subscription_status,
+          sp.starts_at,
+          sp.expires_at,
+          sp.created_at AS purchase_date,
+
+          pay.amount,
+          pay.payment_gateway,
+          pay.payment_id,
+          pay.order_id,
+          pay.payment_status,
+          pay.payment_date
+
+        FROM seller_package_subscriptions sp
+
+        LEFT JOIN sellers s
+          ON s.id = sp.seller_id
+
+        LEFT JOIN seller_payments pay
+          ON pay.id = sp.payment_record_id
+
+        ORDER BY sp.created_at DESC
+      `);
+
+      const packages = rows.map((item) => {
+        let status = String(
+          item.subscription_status || ""
+        ).toLowerCase();
+
+        if (
+          status !== "cancelled" &&
+          status !== "canceled" &&
+          status !== "blocked"
+        ) {
+          if (
+            item.expires_at &&
+            new Date(item.expires_at) < new Date()
+          ) {
+            status = "expired";
+          } else {
+            status = status || "active";
+          }
+        }
+
+        return {
+          ...item,
+          status,
+        };
+      });
+
+      return res.status(200).json({
+        success: true,
+        total: packages.length,
+        data: packages,
+      });
+    } catch (error) {
+      console.error(
+        "[ADMIN PACKAGE HISTORY ERROR]",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message: "Unable to fetch package purchase history",
+        error: error.message,
+      });
+    }
+  }
+);
 // ======================================================
 // EXPORT ROUTER
 // ======================================================
+
+
 
 module.exports = router;

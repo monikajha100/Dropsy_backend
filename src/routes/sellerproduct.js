@@ -6,6 +6,7 @@ const crypto = require("crypto");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
+const { ensureInvoice } = require("./invoiceService");
 
 const TABLE = "dropshy_seller_products";
 const MAX_FILE_SIZE = 5 * 1024 * 1024;
@@ -785,6 +786,78 @@ router.delete("/:id", authenticateSeller, async (req, res) => {
       success: false,
       message: "Could not delete product",
     });
+  }
+});
+// ======================================================
+// INVOICE PDF
+// GET /api/seller-products/:id/invoice
+// ======================================================
+
+router.get("/:id/invoice", authenticateSeller, async (req, res) => {
+  try {
+    if (!validId(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid product ID" });
+    }
+
+    const [rows] = await pool.query(
+      `SELECT * FROM ${TABLE} WHERE id = ? AND seller_id = ? LIMIT 1`,
+      [req.params.id, req.sellerId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+
+    const p = rows[0];
+
+    if (String(p.status).toLowerCase() !== "active") {
+      return res.status(403).json({
+        success: false,
+        message: "Invoice product approve hone ke baad available hoga",
+      });
+    }
+
+    const PDFDocument = require("pdfkit");
+    const doc = new PDFDocument({ size: "A4", margin: 50 });
+
+    const invoiceNo = `INV-${p.id}-${Date.now().toString().slice(-6)}`;
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${invoiceNo}.pdf"`);
+    doc.pipe(res);
+
+    const rs = (v) => "Rs. " + Number(v || 0).toLocaleString("en-IN");
+
+    doc.fontSize(22).text("DROPSHY", { align: "left" });
+    doc.fontSize(10).fillColor("#667085").text("Product Invoice");
+    doc.moveDown();
+
+    doc.fillColor("#000").fontSize(11);
+    doc.text(`Invoice No: ${invoiceNo}`);
+    doc.text(`Date: ${new Date().toLocaleDateString("en-IN")}`);
+    doc.text(`Seller ID: ${p.seller_id}`);
+    doc.moveDown();
+
+    doc.fontSize(13).text("Product Details", { underline: true });
+    doc.moveDown(0.5).fontSize(11);
+    doc.text(`Name: ${p.product_name}`);
+    doc.text(`SKU: ${p.sku}`);
+    doc.text(`Category: ${p.category_name}${p.subcategory_name ? " / " + p.subcategory_name : ""}`);
+    doc.text(`Stock: ${p.stock_quantity}`);
+    doc.moveDown();
+
+    doc.fontSize(13).text("Pricing", { underline: true });
+    doc.moveDown(0.5).fontSize(11);
+    doc.text(`MRP: ${rs(p.mrp)}`);
+    doc.text(`Wholesale Price: ${rs(p.wholesale_price)}`);
+    doc.text(`Selling Price: ${rs(p.selling_price)}`);
+
+    doc.end();
+  } catch (error) {
+    console.error("Invoice error:", error);
+    if (!res.headersSent) {
+      return res.status(500).json({ success: false, message: "Invoice generation failed" });
+    }
   }
 });
 
