@@ -31,7 +31,13 @@ const corsOptions = {
     return callback(new Error("Not allowed by CORS"));
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "Accept"],
+  allowedHeaders: [
+  "Content-Type",
+  "Authorization",
+  "Accept",
+  "X-Requested-With",
+  "Origin",
+],
   credentials: true,
   optionsSuccessStatus: 204,
 };
