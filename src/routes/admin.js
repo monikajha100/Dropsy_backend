@@ -810,17 +810,22 @@ router.patch(
 );
 
 // ======================================================
-// SUPPORT TICKETS (ADMIN)
-// GET   /api/admin/tickets
-// PATCH /api/admin/tickets/:id/status
+// SUPPORT TICKETS - ADMIN
+// GET /admin/tickets
+// PATCH /admin/tickets/:id/status
 // ======================================================
 
-router.get("/tickets", authenticateAdmin, async (req, res) => {
+// GET ALL SUPPORT TICKETS
+router.get("/tickets", verifyAdmin, async (req, res) => {
   try {
     const { status, search } = req.query;
 
     const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit) || 20));
+    const limit = Math.min(
+      1000,
+      Math.max(1, parseInt(req.query.limit) || 20)
+    );
+
     const offset = (page - 1) * limit;
 
     const where = [];
@@ -831,104 +836,172 @@ router.get("/tickets", authenticateAdmin, async (req, res) => {
       params.push(status);
     }
 
-    if (search) {
-      where.push(
-        "(t.ticket_number LIKE ? OR t.order_awb LIKE ? OR t.category LIKE ?)"
-      );
-      const q = `%${search}%`;
-      params.push(q, q, q);
+    if (search && String(search).trim()) {
+      const q = `%${String(search).trim()}%`;
+
+      where.push(`(
+        t.ticket_number LIKE ?
+        OR t.order_awb LIKE ?
+        OR t.category LIKE ?
+        OR t.message LIKE ?
+        OR s.fullName LIKE ?
+        OR s.email LIKE ?
+        OR s.enrollmentNumber LIKE ?
+      )`);
+
+      params.push(q, q, q, q, q, q, q);
     }
 
-    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const whereSql = where.length
+      ? `WHERE ${where.join(" AND ")}`
+      : "";
 
     const [tickets] = await pool.query(
       `SELECT
-         t.id,
-         t.ticket_number AS ticketNumber,
-         t.category,
-         t.order_awb AS orderId,
-         t.message,
-         t.attachment,
-         t.status,
-         t.created_at AS createdAt,
-         t.updated_at AS updatedAt,
-         s.name AS sellerName,
-         s.enrollment_number AS enrollmentNumber,
-         s.mobile AS mobile,
-         s.email AS email
-       FROM support_tickets t
-       LEFT JOIN sellers s ON s.id = t.seller_id
-       ${whereSql}
-       ORDER BY t.id DESC
-       LIMIT ? OFFSET ?`,
+        t.id,
+        t.ticket_number AS ticketNumber,
+        t.seller_id AS sellerId,
+        t.category,
+        t.order_awb AS orderId,
+        t.order_awb AS orderAwb,
+        t.message,
+        t.attachment,
+        t.status,
+        t.created_at AS createdAt,
+        t.updated_at AS updatedAt,
+        s.fullName AS sellerName,
+        s.enrollmentNumber AS enrollmentNumber,
+        s.mobile AS mobile,
+        s.email AS email
+      FROM support_tickets t
+      LEFT JOIN sellers s ON s.id = t.seller_id
+      ${whereSql}
+      ORDER BY t.id DESC
+      LIMIT ? OFFSET ?`,
       [...params, limit, offset]
     );
 
-    const [[{ total }]] = await pool.query(
-      `SELECT COUNT(*) AS total FROM support_tickets t ${whereSql}`,
+    const [[countResult]] = await pool.query(
+      `SELECT COUNT(*) AS total
+       FROM support_tickets t
+       LEFT JOIN sellers s ON s.id = t.seller_id
+       ${whereSql}`,
       params
     );
 
-    return res.status(200).json({ success: true, total, page, limit, tickets });
+    return res.status(200).json({
+      success: true,
+      total: Number(countResult.total),
+      page,
+      limit,
+      tickets,
+    });
+
   } catch (error) {
     console.error("ADMIN FETCH TICKETS ERROR:", error);
+
     return res.status(500).json({
       success: false,
       message: "Unable to fetch support tickets.",
+      error: error.message,
     });
   }
 });
 
-router.patch("/tickets/:id/status", authenticateAdmin, async (req, res) => {
-  try {
-    const ticketId = parseInt(req.params.id);
-    const status = String(req.body.status || "").toLowerCase();
 
-    if (!ticketId) {
-      return res.status(400).json({ success: false, message: "Invalid ticket id." });
-    }
-
-    if (!["open", "resolved", "closed"].includes(status)) {
-      return res.status(400).json({ success: false, message: "Invalid status." });
-    }
-
-    const [[ticket]] = await pool.query(
-      `SELECT seller_id, ticket_number FROM support_tickets WHERE id = ? LIMIT 1`,
-      [ticketId]
-    );
-
-    if (!ticket) {
-      return res.status(404).json({ success: false, message: "Ticket not found." });
-    }
-
-    await pool.query(
-      `UPDATE support_tickets SET status = ?, updated_at = NOW() WHERE id = ?`,
-      [status, ticketId]
-    );
-
+// UPDATE TICKET STATUS
+router.patch(
+  "/tickets/:id/status",
+  verifyAdmin,
+  async (req, res) => {
     try {
-      await pool.query(
-        `INSERT INTO notifications
-         (seller_id, title, message, notification_type, reference_type, reference_id, is_read)
-         VALUES (?, ?, ?, 'support_ticket', 'support_ticket', ?, 0)`,
-        [
-          ticket.seller_id,
-          "Ticket Updated",
-          `Your support ticket ${ticket.ticket_number} is now ${status}.`,
-          ticketId,
-        ]
-      );
-    } catch (notificationError) {
-      console.error("ADMIN TICKET NOTIFICATION ERROR:", notificationError);
-    }
+      const ticketId = Number(req.params.id);
 
-    return res.status(200).json({ success: true, message: "Ticket status updated." });
-  } catch (error) {
-    console.error("ADMIN UPDATE TICKET STATUS ERROR:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Unable to update ticket status.",
-    });
+      const status = String(
+        req.body.status || ""
+      ).toLowerCase();
+
+      if (!Number.isInteger(ticketId) || ticketId <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid ticket ID.",
+        });
+      }
+
+      if (!["open", "resolved", "closed"].includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid ticket status.",
+        });
+      }
+
+      const [[ticket]] = await pool.query(
+        `SELECT id, seller_id, ticket_number
+         FROM support_tickets
+         WHERE id = ?
+         LIMIT 1`,
+        [ticketId]
+      );
+
+      if (!ticket) {
+        return res.status(404).json({
+          success: false,
+          message: "Ticket not found.",
+        });
+      }
+
+      await pool.query(
+        `UPDATE support_tickets
+         SET status = ?, updated_at = NOW()
+         WHERE id = ?`,
+        [status, ticketId]
+      );
+
+      try {
+        await pool.query(
+          `INSERT INTO notifications
+          (
+            seller_id,
+            title,
+            message,
+            notification_type,
+            reference_type,
+            reference_id,
+            is_read
+          )
+          VALUES (?, ?, ?, 'support_ticket', 'support_ticket', ?, 0)`,
+          [
+            ticket.seller_id,
+            "Ticket Updated",
+            `Your support ticket ${ticket.ticket_number} is now ${status}.`,
+            ticketId,
+          ]
+        );
+      } catch (notificationError) {
+        console.error(
+          "ADMIN TICKET NOTIFICATION ERROR:",
+          notificationError
+        );
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Ticket status updated successfully.",
+        ticketId,
+        status,
+      });
+
+    } catch (error) {
+      console.error("ADMIN UPDATE TICKET STATUS ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Unable to update ticket status.",
+        error: error.message,
+      });
+    }
   }
-});
+);
+
+
 module.exports = router;
