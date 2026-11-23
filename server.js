@@ -88,7 +88,9 @@ console.log(
 app.use("/api", usersRouter);
 
 // Admin
+//app.use("/admin", require("./src/routes/admin"));
 app.use("/admin", require("./src/routes/admin"));
+app.use("/api/admin", require("./src/routes/admin"));
 //app.use("SellerApi", require("./src/routes/SellerApi"));
 
 // Seller
