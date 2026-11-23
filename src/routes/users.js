@@ -24,11 +24,31 @@ const MODULES = [
   "Settings",
 ];
 
-const normalizeRole = (role) => {
-  const found = ROLES.find(
-    (item) => item.toLowerCase() === String(role || "").trim().toLowerCase()
-  );
-  return found || null;
+const normalizeRole = (role) =>
+  ROLES.find(
+    (item) =>
+      item.toLowerCase() ===
+      String(role || "").trim().toLowerCase()
+  ) || null;
+
+const normalizePermissions = (role, permissions) => {
+  if (!["Admin", "Sub Admin"].includes(role)) return [];
+
+  if (!Array.isArray(permissions)) return [];
+
+  return [...new Set(
+    permissions.filter((p) => MODULES.includes(p))
+  )];
+};
+
+const parsePermissions = (permissions) => {
+  if (Array.isArray(permissions)) return permissions;
+
+  try {
+    return JSON.parse(permissions || "[]");
+  } catch {
+    return [];
+  }
 };
 
 // =====================================================
@@ -50,43 +70,55 @@ const adminAuth = (req, res, next) => {
     const decoded = jwt.verify(token, JWT_SECRET);
 
     const role = String(
-      decoded.role || decoded.userRole || decoded.accountType || ""
+      decoded.role ||
+      decoded.userRole ||
+      decoded.accountType ||
+      ""
     ).toLowerCase();
 
     if (role !== "admin") {
       return res.status(403).json({
         status: false,
-        message: "Only Admin can manage user accounts.",
+        message: "Only Admin can manage users.",
       });
     }
 
     req.admin = decoded;
     next();
-  } catch (error) {
-  console.error("CREATE USER ERROR:", error);
 
-  return res.status(500).json({
-    status: false,
-    message: "Unable to create account.",
-    error: error.message,
-    code: error.code || null,
-    sqlMessage: error.sqlMessage || null,
-  });
-}
+  } catch (error) {
+    console.error("ADMIN AUTH ERROR:", error.message);
+
+    return res.status(401).json({
+      status: false,
+      message: "Invalid or expired admin token.",
+    });
+  }
 };
 
 // =====================================================
-// REGISTER CUSTOMER - PUBLIC
+// REGISTER CUSTOMER
 // =====================================================
 
 router.post("/users/register", async (req, res) => {
   try {
     const { name, email, phone, password } = req.body;
 
-    if (!name || !email || !password) {
+    if (
+      !String(name || "").trim() ||
+      !String(email || "").trim() ||
+      !password
+    ) {
       return res.status(400).json({
         status: false,
         message: "Name, email and password are required.",
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        status: false,
+        message: "Password must contain at least 6 characters.",
       });
     }
 
@@ -123,6 +155,7 @@ router.post("/users/register", async (req, res) => {
       message: "Customer account created successfully.",
       userId: result.insertId,
     });
+
   } catch (error) {
     console.error("REGISTER ERROR:", error);
 
@@ -149,7 +182,10 @@ router.post("/users/login", async (req, res) => {
     }
 
     const [users] = await pool.query(
-      `SELECT id, name, email, phone, password, role, status
+      `SELECT id, name, email, phone, password,
+              role, status, department, designation,
+              reporting_manager, branch, employment_type,
+              joining_date, permissions
        FROM users
        WHERE email = ?`,
       [email.trim().toLowerCase()]
@@ -164,14 +200,17 @@ router.post("/users/login", async (req, res) => {
 
     const user = users[0];
 
-    if (user.status === "inactive") {
+    if (user.status !== "active") {
       return res.status(403).json({
         status: false,
         message: "Your account has been deactivated.",
       });
     }
 
-    const match = await bcrypt.compare(password, user.password);
+    const match = await bcrypt.compare(
+      password,
+      user.password
+    );
 
     if (!match) {
       return res.status(401).json({
@@ -190,18 +229,17 @@ router.post("/users/login", async (req, res) => {
       { expiresIn: "7d" }
     );
 
-    return res.status(200).json({
+    return res.json({
       status: true,
       message: "Login successful.",
       token,
       user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role || "Customer",
+        ...user,
+        password: undefined,
+        permissions: parsePermissions(user.permissions),
       },
     });
+
   } catch (error) {
     console.error("LOGIN ERROR:", error);
 
@@ -213,7 +251,7 @@ router.post("/users/login", async (req, res) => {
 });
 
 // =====================================================
-// GET ALL USERS - ADMIN ONLY
+// GET ALL USERS
 // =====================================================
 
 router.get("/users/all", adminAuth, async (req, res) => {
@@ -233,12 +271,10 @@ router.get("/users/all", adminAuth, async (req, res) => {
       count: rows.length,
       users: rows.map((user) => ({
         ...user,
-        permissions:
-          typeof user.permissions === "string"
-            ? JSON.parse(user.permissions || "[]")
-            : user.permissions || [],
+        permissions: parsePermissions(user.permissions),
       })),
     });
+
   } catch (error) {
     console.error("FETCH USERS ERROR:", error);
 
@@ -250,7 +286,7 @@ router.get("/users/all", adminAuth, async (req, res) => {
 });
 
 // =====================================================
-// CREATE USER - ADMIN ONLY
+// CREATE USER
 // =====================================================
 
 router.post("/users/create", adminAuth, async (req, res) => {
@@ -273,7 +309,13 @@ router.post("/users/create", adminAuth, async (req, res) => {
     const cleanRole = normalizeRole(role);
     const cleanEmail = String(email || "").trim().toLowerCase();
 
-    if (!name || !cleanEmail || !phone || !password || !cleanRole) {
+    if (
+      !String(name || "").trim() ||
+      !cleanEmail ||
+      !phone ||
+      !password ||
+      !cleanRole
+    ) {
       return res.status(400).json({
         status: false,
         message: "Please provide all required details.",
@@ -284,13 +326,6 @@ router.post("/users/create", adminAuth, async (req, res) => {
       return res.status(400).json({
         status: false,
         message: "Password must contain at least 6 characters.",
-      });
-    }
-
-    if (cleanRole === "Customer" && permissions?.length) {
-      return res.status(400).json({
-        status: false,
-        message: "Customers cannot receive admin permissions.",
       });
     }
 
@@ -308,12 +343,10 @@ router.post("/users/create", adminAuth, async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    const safePermissions =
-      ["Admin", "Sub Admin"].includes(cleanRole)
-        ? (Array.isArray(permissions)
-            ? permissions.filter((p) => MODULES.includes(p))
-            : [])
-        : [];
+    const safePermissions = normalizePermissions(
+      cleanRole,
+      permissions
+    );
 
     const [result] = await pool.query(
       `INSERT INTO users (
@@ -342,6 +375,7 @@ router.post("/users/create", adminAuth, async (req, res) => {
       message: `${cleanRole} created successfully.`,
       userId: result.insertId,
     });
+
   } catch (error) {
     console.error("CREATE USER ERROR:", error);
 
@@ -353,12 +387,19 @@ router.post("/users/create", adminAuth, async (req, res) => {
 });
 
 // =====================================================
-// UPDATE USER - ADMIN ONLY
+// UPDATE USER
 // =====================================================
 
 router.put("/users/:id", adminAuth, async (req, res) => {
   try {
     const { id } = req.params;
+
+    if (!/^\d+$/.test(id)) {
+      return res.status(400).json({
+        status: false,
+        message: "Invalid user ID.",
+      });
+    }
 
     const {
       name,
@@ -378,7 +419,12 @@ router.put("/users/:id", adminAuth, async (req, res) => {
     const cleanRole = normalizeRole(role);
     const cleanEmail = String(email || "").trim().toLowerCase();
 
-    if (!name || !cleanEmail || !phone || !cleanRole) {
+    if (
+      !String(name || "").trim() ||
+      !cleanEmail ||
+      !phone ||
+      !cleanRole
+    ) {
       return res.status(400).json({
         status: false,
         message: "Name, email, phone and valid role are required.",
@@ -397,13 +443,6 @@ router.put("/users/:id", adminAuth, async (req, res) => {
       });
     }
 
-    const safePermissions =
-      ["Admin", "Sub Admin"].includes(cleanRole)
-        ? (Array.isArray(permissions)
-            ? permissions.filter((p) => MODULES.includes(p))
-            : [])
-        : [];
-
     const values = [
       name.trim(),
       cleanEmail,
@@ -415,7 +454,9 @@ router.put("/users/:id", adminAuth, async (req, res) => {
       branch || null,
       employment_type || null,
       joining_date || null,
-      JSON.stringify(safePermissions),
+      JSON.stringify(
+        normalizePermissions(cleanRole, permissions)
+      ),
     ];
 
     let sql = `
@@ -455,6 +496,7 @@ router.put("/users/:id", adminAuth, async (req, res) => {
       status: true,
       message: "User updated successfully.",
     });
+
   } catch (error) {
     console.error("UPDATE USER ERROR:", error);
 
@@ -496,12 +538,62 @@ router.patch("/users/:id/status", adminAuth, async (req, res) => {
       status: true,
       message: `Account ${status} successfully.`,
     });
+
   } catch (error) {
     console.error("STATUS UPDATE ERROR:", error);
 
     return res.status(500).json({
       status: false,
       message: "Unable to update account status.",
+    });
+  }
+});
+
+// =====================================================
+// DELETE USER
+// =====================================================
+
+router.delete("/users/:id", adminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!/^\d+$/.test(id)) {
+      return res.status(400).json({
+        status: false,
+        message: "Invalid user ID.",
+      });
+    }
+
+    if (Number(id) === Number(req.admin.id)) {
+      return res.status(400).json({
+        status: false,
+        message: "You cannot delete your own account.",
+      });
+    }
+
+    const [result] = await pool.query(
+      "DELETE FROM users WHERE id = ?",
+      [id]
+    );
+
+    if (!result.affectedRows) {
+      return res.status(404).json({
+        status: false,
+        message: "User not found.",
+      });
+    }
+
+    return res.json({
+      status: true,
+      message: "User deleted successfully.",
+    });
+
+  } catch (error) {
+    console.error("DELETE USER ERROR:", error);
+
+    return res.status(500).json({
+      status: false,
+      message: "Unable to delete user.",
     });
   }
 });

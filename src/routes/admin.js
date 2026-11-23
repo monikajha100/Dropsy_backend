@@ -1,4 +1,3 @@
-
 const express = require("express");
 const router = express.Router();
 
@@ -385,6 +384,157 @@ router.get("/sellers", verifyAdmin, async (req, res) => {
 });
 
 // ======================================================
+// ADMIN: SELLER PACKAGES
+// GET /admin/seller-packages
+//
+// Shows which seller purchased which package, when it was
+// purchased and when it expires.
+//
+// Optional query parameters:
+//   status    = active | expiring | expired
+//   seller_id = numeric seller ID
+//   search    = seller name / email / mobile / enrollment / package
+//
+// ASSUMED TABLES (rename to match your database):
+//   seller_packages (id, seller_id, package_id, amount_paid,
+//                    purchase_date, expiry_date)
+//   packages        (id, package_name, duration_days)
+//
+// If expiry_date is empty, it is calculated as
+// purchase_date + duration_days.
+// ======================================================
+
+const PACKAGE_EXPIRING_SOON_DAYS = 7;
+
+router.get("/seller-packages", verifyAdmin, async (req, res) => {
+  try {
+    const { status, seller_id, search } = req.query;
+
+    let sql = `
+      SELECT *
+      FROM (
+        SELECT
+          sp.id,
+          sp.seller_id,
+          s.fullName AS seller_name,
+          s.email AS seller_email,
+          s.mobile AS seller_phone,
+          s.enrollmentNumber AS enrollment_number,
+          p.id AS package_id,
+          p.package_name AS package_name,
+          p.duration_days AS duration_days,
+          sp.amount_paid AS amount_paid,
+          sp.purchase_date AS purchase_date,
+          COALESCE(
+            sp.expiry_date,
+            DATE_ADD(sp.purchase_date, INTERVAL p.duration_days DAY)
+          ) AS expiry_date
+        FROM seller_packages sp
+        LEFT JOIN sellers s ON s.id = sp.seller_id
+        LEFT JOIN packages p ON p.id = sp.package_id
+      ) t
+      WHERE 1 = 1
+    `;
+
+    const params = [];
+
+    if (seller_id) {
+      if (!/^\d+$/.test(String(seller_id))) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid seller ID",
+        });
+      }
+
+      sql += " AND t.seller_id = ?";
+      params.push(Number(seller_id));
+    }
+
+    if (status) {
+      if (!["active", "expiring", "expired"].includes(String(status))) {
+        return res.status(400).json({
+          success: false,
+          message: "Status must be active, expiring or expired",
+        });
+      }
+
+      if (status === "expired") {
+        sql += " AND t.expiry_date < NOW()";
+      } else if (status === "expiring") {
+        sql += `
+          AND t.expiry_date >= NOW()
+          AND t.expiry_date <= DATE_ADD(NOW(), INTERVAL ? DAY)
+        `;
+        params.push(PACKAGE_EXPIRING_SOON_DAYS);
+      } else {
+        sql += `
+          AND t.expiry_date > DATE_ADD(NOW(), INTERVAL ? DAY)
+        `;
+        params.push(PACKAGE_EXPIRING_SOON_DAYS);
+      }
+    }
+
+    if (search && String(search).trim()) {
+      const value = `%${String(search).trim()}%`;
+
+      sql += `
+        AND (
+          t.seller_name LIKE ?
+          OR t.seller_email LIKE ?
+          OR t.seller_phone LIKE ?
+          OR t.enrollment_number LIKE ?
+          OR t.package_name LIKE ?
+        )
+      `;
+
+      params.push(value, value, value, value, value);
+    }
+
+    sql += " ORDER BY t.purchase_date DESC, t.id DESC";
+
+    const [rows] = await pool.query(sql, params);
+
+    const now = Date.now();
+    const soonLimit = now + PACKAGE_EXPIRING_SOON_DAYS * 86400000;
+
+    const summary = rows.reduce(
+      (acc, row) => {
+        const expiry = row.expiry_date
+          ? new Date(row.expiry_date).getTime()
+          : null;
+
+        acc.total += 1;
+
+        if (expiry === null) return acc;
+
+        if (expiry < now) acc.expired += 1;
+        else if (expiry <= soonLimit) acc.expiring += 1;
+        else acc.active += 1;
+
+        return acc;
+      },
+      { total: 0, active: 0, expiring: 0, expired: 0 }
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Seller packages fetched successfully",
+      count: rows.length,
+      summary,
+      data: rows,
+    });
+  } catch (error) {
+    console.error("ADMIN SELLER PACKAGES ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not fetch seller packages.",
+      error: error.message,
+    });
+  }
+});
+
+// ======================================================
 // SELLER PRODUCT APPROVAL SYSTEM
 // ======================================================
 
@@ -659,5 +809,126 @@ router.patch(
   }
 );
 
+// ======================================================
+// SUPPORT TICKETS (ADMIN)
+// GET   /api/admin/tickets
+// PATCH /api/admin/tickets/:id/status
+// ======================================================
 
+router.get("/tickets", authenticateAdmin, async (req, res) => {
+  try {
+    const { status, search } = req.query;
+
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit) || 20));
+    const offset = (page - 1) * limit;
+
+    const where = [];
+    const params = [];
+
+    if (status && status !== "all") {
+      where.push("t.status = ?");
+      params.push(status);
+    }
+
+    if (search) {
+      where.push(
+        "(t.ticket_number LIKE ? OR t.order_awb LIKE ? OR t.category LIKE ?)"
+      );
+      const q = `%${search}%`;
+      params.push(q, q, q);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    const [tickets] = await pool.query(
+      `SELECT
+         t.id,
+         t.ticket_number AS ticketNumber,
+         t.category,
+         t.order_awb AS orderId,
+         t.message,
+         t.attachment,
+         t.status,
+         t.created_at AS createdAt,
+         t.updated_at AS updatedAt,
+         s.name AS sellerName,
+         s.enrollment_number AS enrollmentNumber,
+         s.mobile AS mobile,
+         s.email AS email
+       FROM support_tickets t
+       LEFT JOIN sellers s ON s.id = t.seller_id
+       ${whereSql}
+       ORDER BY t.id DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(*) AS total FROM support_tickets t ${whereSql}`,
+      params
+    );
+
+    return res.status(200).json({ success: true, total, page, limit, tickets });
+  } catch (error) {
+    console.error("ADMIN FETCH TICKETS ERROR:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to fetch support tickets.",
+    });
+  }
+});
+
+router.patch("/tickets/:id/status", authenticateAdmin, async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id);
+    const status = String(req.body.status || "").toLowerCase();
+
+    if (!ticketId) {
+      return res.status(400).json({ success: false, message: "Invalid ticket id." });
+    }
+
+    if (!["open", "resolved", "closed"].includes(status)) {
+      return res.status(400).json({ success: false, message: "Invalid status." });
+    }
+
+    const [[ticket]] = await pool.query(
+      `SELECT seller_id, ticket_number FROM support_tickets WHERE id = ? LIMIT 1`,
+      [ticketId]
+    );
+
+    if (!ticket) {
+      return res.status(404).json({ success: false, message: "Ticket not found." });
+    }
+
+    await pool.query(
+      `UPDATE support_tickets SET status = ?, updated_at = NOW() WHERE id = ?`,
+      [status, ticketId]
+    );
+
+    try {
+      await pool.query(
+        `INSERT INTO notifications
+         (seller_id, title, message, notification_type, reference_type, reference_id, is_read)
+         VALUES (?, ?, ?, 'support_ticket', 'support_ticket', ?, 0)`,
+        [
+          ticket.seller_id,
+          "Ticket Updated",
+          `Your support ticket ${ticket.ticket_number} is now ${status}.`,
+          ticketId,
+        ]
+      );
+    } catch (notificationError) {
+      console.error("ADMIN TICKET NOTIFICATION ERROR:", notificationError);
+    }
+
+    return res.status(200).json({ success: true, message: "Ticket status updated." });
+  } catch (error) {
+    console.error("ADMIN UPDATE TICKET STATUS ERROR:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to update ticket status.",
+    });
+  }
+});
 module.exports = router;
