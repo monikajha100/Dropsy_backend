@@ -3,6 +3,10 @@ const router = express.Router();
 
 const jwt = require("jsonwebtoken");
 const pool = require("./pool");
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const multer = require("multer");
 
 const JWT_SECRET =
   process.env.JWT_SECRET || "DROPSHY_ADMIN_SECRET_2026";
@@ -928,7 +932,7 @@ router.patch(
         });
       }
 
-      if (!["open", "resolved", "closed"].includes(status)) {
+      if (!["open", "in_progress", "waiting_for_seller", "resolved", "closed"].includes(status)) {
         return res.status(400).json({
           success: false,
           message: "Invalid ticket status.",
@@ -1003,5 +1007,158 @@ router.patch(
   }
 );
 
+
+// ======================================================
+// SUPPORT TICKETS - CONVERSATION AND REPLY
+// GET  /admin/tickets/:id
+// POST /admin/tickets/:id/replies
+// ======================================================
+
+const UPLOAD_DIR = path.resolve(__dirname, "../../uploads");
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+const EXTENSIONS = {
+  "image/jpeg": ".jpg",
+  "image/png": ".png",
+  "application/pdf": ".pdf",
+};
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+    filename: (req, file, cb) =>
+      cb(null, `${crypto.randomUUID()}${EXTENSIONS[file.mimetype]}`),
+  }),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+  fileFilter: (req, file, cb) =>
+    EXTENSIONS[file.mimetype]
+      ? cb(null, true)
+      : cb(new Error("Only JPG, PNG and PDF files are allowed.")),
+});
+
+const removeFile = (file) => file?.path && fs.unlink(file.path, () => {});
+
+const fail = (res, status, message) =>
+  res.status(status).json({ success: false, message });
+
+async function findTicket(id) {
+  const [rows] = await pool.query(
+    `SELECT id, ticket_number AS ticketNumber, seller_id AS sellerId,
+            category, category AS subject, order_awb AS orderId,
+            order_awb AS orderAwb, message, attachment, status,
+            created_at AS createdAt, updated_at AS updatedAt
+     FROM support_tickets
+     WHERE ticket_number = ? OR id = ?
+     LIMIT 1`,
+    [id, id]
+  );
+  return rows[0];
+}
+
+// GET /admin/tickets/:id
+router.get("/tickets/:id", verifyAdmin, async (req, res) => {
+  try {
+    const ticket = await findTicket(req.params.id);
+    if (!ticket) return fail(res, 404, "Ticket not found.");
+
+    const [replies] = await pool.query(
+      `SELECT id, ticket_id AS ticketId, sender_type AS senderType,
+              sender_id AS senderId, message, attachment,
+              created_at AS createdAt
+       FROM support_ticket_replies
+       WHERE ticket_id = ?
+       ORDER BY id ASC`,
+      [ticket.id]
+    );
+
+    return res.json({ success: true, ticket, replies });
+  } catch (error) {
+    console.error("ADMIN FETCH TICKET ERROR:", error);
+    return fail(res, 500, "Unable to load ticket conversation.");
+  }
+});
+
+// POST /admin/tickets/:id/replies
+router.post(
+  "/tickets/:id/replies",
+  verifyAdmin,
+  (req, res, next) => {
+    upload.single("attachment")(req, res, (error) =>
+      error ? fail(res, 400, error.message) : next()
+    );
+  },
+  async (req, res) => {
+    const reject = (status, message) => {
+      removeFile(req.file);
+      return fail(res, status, message);
+    };
+
+    try {
+      const message = String(req.body?.message || "").trim();
+      if (!message) return reject(400, "Reply message is required.");
+      if (message.length > 500) {
+        return reject(400, "Reply cannot exceed 500 characters.");
+      }
+
+      const ticket = await findTicket(req.params.id);
+      if (!ticket) return reject(404, "Ticket not found.");
+
+      if (["closed", "resolved"].includes(String(ticket.status).toLowerCase())) {
+        return reject(400, "This ticket is closed.");
+      }
+
+      const adminId = req.admin.id;
+      if (!adminId) return reject(401, "Admin ID not found.");
+
+      const attachment = req.file ? `uploads/${req.file.filename}` : null;
+
+      const [result] = await pool.query(
+        `INSERT INTO support_ticket_replies
+           (ticket_id, sender_type, sender_id, message, attachment)
+         VALUES (?, 'admin', ?, ?, ?)`,
+        [ticket.id, adminId, message, attachment]
+      );
+
+      // Reply save ho chuki hai; neeche ki error se request fail nahi honi chahiye
+      try {
+        await pool.query(
+          "UPDATE support_tickets SET updated_at = NOW() WHERE id = ?",
+          [ticket.id]
+        );
+        await pool.query(
+          `INSERT INTO notifications
+             (seller_id, title, message, notification_type,
+              reference_type, reference_id, is_read)
+           VALUES (?, ?, ?, 'support_ticket', 'support_ticket', ?, 0)`,
+          [
+            ticket.sellerId,
+            "Support Ticket Reply",
+            `Support replied to your ticket ${ticket.ticketNumber}.`,
+            ticket.id,
+          ]
+        );
+      } catch (sideError) {
+        console.error("ADMIN REPLY FOLLOW-UP ERROR:", sideError);
+      }
+
+      return res.status(201).json({
+        success: true,
+        message: "Reply sent successfully.",
+        reply: {
+          id: result.insertId,
+          ticketId: ticket.id,
+          senderType: "admin",
+          senderId: adminId,
+          message,
+          attachment,
+          createdAt: new Date(),
+        },
+      });
+    } catch (error) {
+      console.error("ADMIN TICKET REPLY ERROR:", error);
+      return reject(500, "Unable to send ticket reply.");
+    }
+  }
+);
 
 module.exports = router;
