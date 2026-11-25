@@ -270,6 +270,24 @@ router.post(
       );
 
       const ticketId = ticketResult.insertId;
+      // Save seller's original ticket message in conversation
+await connection.query(
+  `INSERT INTO support_ticket_replies
+  (
+    ticket_id,
+    sender_type,
+    sender_id,
+    message,
+    attachment
+  )
+  VALUES (?, 'seller', ?, ?, ?)`,
+  [
+    ticketId,
+    sellerId,
+    message,
+    attachment,
+  ]
+);
 
       await connection.commit();
       transactionStarted = false;
@@ -396,4 +414,242 @@ router.get("/my", authenticateSeller, async (req, res) => {
   }
 });
 
+// ======================================================
+// GET SELLER TICKET CONVERSATION
+// GET /api/tickets/:id
+// ======================================================
+
+router.get("/:id", authenticateSeller, async (req, res) => {
+  try {
+    const ticketId = clean(req.params.id);
+
+    if (!ticketId) {
+      return res.status(400).json({
+        success: false,
+        message: "Ticket ID is required.",
+      });
+    }
+
+    // Check that this ticket belongs to the logged-in seller.
+    const [tickets] = await pool.query(
+      `SELECT
+        id,
+        ticket_number AS ticketNumber,
+        seller_id AS sellerId,
+        category,
+        category AS subject,
+        order_awb AS orderId,
+        order_awb AS orderAwb,
+        message,
+        attachment,
+        status,
+        created_at AS createdAt,
+        updated_at AS updatedAt
+       FROM support_tickets
+       WHERE (ticket_number = ? OR id = ?)
+         AND seller_id = ?
+       LIMIT 1`,
+      [ticketId, ticketId, req.sellerId]
+    );
+
+    if (!tickets.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Ticket not found.",
+      });
+    }
+
+    const ticket = tickets[0];
+
+    // Fetch original message and all replies from the same conversation.
+    const [replies] = await pool.query(
+      `SELECT
+        id,
+        ticket_id AS ticketId,
+        sender_type AS senderType,
+        sender_id AS senderId,
+        message,
+        attachment,
+        created_at AS createdAt
+       FROM support_ticket_replies
+       WHERE ticket_id = ?
+       ORDER BY id ASC`,
+      [ticket.id]
+    );
+
+    return res.status(200).json({
+      success: true,
+      ticket,
+      replies,
+    });
+
+  } catch (error) {
+    console.error("FETCH TICKET CONVERSATION ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to load ticket conversation.",
+    });
+  }
+});
+// ======================================================
+// SELLER REPLY TO TICKET
+// POST /api/tickets/:id/replies
+// ======================================================
+
+router.post(
+  "/:id/replies",
+  authenticateSeller,
+
+  (req, res, next) => {
+    upload.single("attachment")(req, res, (error) => {
+      if (error) {
+        return res.status(400).json({
+          success: false,
+          message: error.message || "Attachment upload failed.",
+        });
+      }
+
+      next();
+    });
+  },
+
+  async (req, res) => {
+    let connection;
+    let transactionStarted = false;
+
+    try {
+      const ticketId = clean(req.params.id);
+      const message = clean(req.body.message);
+
+      if (!ticketId || !message) {
+        removeUploadedFile(req.file);
+
+        return res.status(400).json({
+          success: false,
+          message: "Ticket ID and reply message are required.",
+        });
+      }
+
+      if (message.length > MAX_MESSAGE_LENGTH) {
+        removeUploadedFile(req.file);
+
+        return res.status(400).json({
+          success: false,
+          message: "Reply cannot exceed 500 characters.",
+        });
+      }
+
+      connection = await pool.getConnection();
+      await connection.beginTransaction();
+      transactionStarted = true;
+
+      // Verify ticket ownership and status
+      const [tickets] = await connection.query(
+        `SELECT id, status
+         FROM support_tickets
+         WHERE (ticket_number = ? OR id = ?)
+           AND seller_id = ?
+         LIMIT 1
+         FOR UPDATE`,
+        [ticketId, ticketId, req.sellerId]
+      );
+
+      if (!tickets.length) {
+        await connection.rollback();
+        transactionStarted = false;
+        removeUploadedFile(req.file);
+
+        return res.status(404).json({
+          success: false,
+          message: "Ticket not found.",
+        });
+      }
+
+      const ticket = tickets[0];
+      const currentStatus = String(ticket.status || "").toLowerCase();
+
+      if (["closed", "resolved"].includes(currentStatus)) {
+        await connection.rollback();
+        transactionStarted = false;
+        removeUploadedFile(req.file);
+
+        return res.status(400).json({
+          success: false,
+          message: "This ticket is closed. Please reopen it before replying.",
+        });
+      }
+
+      const attachment = req.file
+        ? `uploads/${req.file.filename}`
+        : null;
+
+      // Save seller reply in the same conversation table
+      const [replyResult] = await connection.query(
+        `INSERT INTO support_ticket_replies
+         (
+           ticket_id,
+           sender_type,
+           sender_id,
+           message,
+           attachment
+         )
+         VALUES (?, 'seller', ?, ?, ?)`,
+        [
+          ticket.id,
+          req.sellerId,
+          message,
+          attachment,
+        ]
+      );
+
+      await connection.query(
+        `UPDATE support_tickets
+         SET updated_at = NOW()
+         WHERE id = ?`,
+        [ticket.id]
+      );
+
+      await connection.commit();
+      transactionStarted = false;
+
+      return res.status(201).json({
+        success: true,
+        message: "Reply sent successfully.",
+        reply: {
+          id: replyResult.insertId,
+          ticketId: ticket.id,
+          senderType: "seller",
+          senderId: req.sellerId,
+          message,
+          attachment,
+          createdAt: new Date(),
+        },
+      });
+
+    } catch (error) {
+      if (connection && transactionStarted) {
+        try {
+          await connection.rollback();
+        } catch (rollbackError) {
+          console.error("REPLY ROLLBACK ERROR:", rollbackError);
+        }
+      }
+
+      removeUploadedFile(req.file);
+
+      console.error("SELLER TICKET REPLY ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Unable to send ticket reply.",
+      });
+
+    } finally {
+      if (connection) {
+        connection.release();
+      }
+    }
+  }
+);
 module.exports = router;
