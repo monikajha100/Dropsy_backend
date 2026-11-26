@@ -163,7 +163,6 @@ function removeUploadedFile(file) {
 router.post(
   "/",
   authenticateSeller,
-
   (req, res, next) => {
     upload.single("attachment")(req, res, (error) => {
       if (error) {
@@ -176,7 +175,6 @@ router.post(
       next();
     });
   },
-
   async (req, res) => {
     let connection;
     let transactionStarted = false;
@@ -197,7 +195,6 @@ router.post(
         clean(req.body.orderId) ||
         clean(req.body.order_id);
 
-      // Validation
       if (!category || !message) {
         removeUploadedFile(req.file);
 
@@ -246,7 +243,6 @@ router.post(
       await connection.beginTransaction();
       transactionStarted = true;
 
-      // Insert ticket using actual database columns.
       const [ticketResult] = await connection.query(
         `INSERT INTO support_tickets
         (
@@ -270,33 +266,30 @@ router.post(
       );
 
       const ticketId = ticketResult.insertId;
-      // Save seller's original ticket message in conversation
-await connection.query(
-  `INSERT INTO support_ticket_replies
-  (
-    ticket_id,
-    sender_type,
-    sender_id,
-    message,
-    attachment
-  )
-  VALUES (?, 'seller', ?, ?, ?)`,
-  [
-    ticketId,
-    sellerId,
-    message,
-    attachment,
-  ]
-);
+
+      // Save original seller message in conversation.
+      await connection.query(
+        `INSERT INTO support_ticket_replies
+        (
+          ticket_id,
+          sender_type,
+          sender_id,
+          message,
+          attachment
+        )
+        VALUES (?, 'seller', ?, ?, ?)`,
+        [
+          ticketId,
+          sellerId,
+          message,
+          attachment,
+        ]
+      );
 
       await connection.commit();
       transactionStarted = false;
 
-      // ==================================================
-      // SELLER NOTIFICATION
-      // Existing notifications table
-      // ==================================================
-
+      // Seller notification.
       try {
         await pool.query(
           `INSERT INTO notifications
@@ -329,7 +322,6 @@ await connection.query(
       return res.status(201).json({
         success: true,
         message: "Support ticket submitted successfully.",
-
         ticket: {
           id: ticketId,
           ticketNumber,
@@ -344,7 +336,6 @@ await connection.query(
           status: "open",
         },
       });
-
     } catch (error) {
       if (connection && transactionStarted) {
         try {
@@ -362,7 +353,6 @@ await connection.query(
         success: false,
         message: "Unable to submit support ticket.",
       });
-
     } finally {
       if (connection) {
         connection.release();
@@ -403,7 +393,6 @@ router.get("/my", authenticateSeller, async (req, res) => {
       count: tickets.length,
       tickets,
     });
-
   } catch (error) {
     console.error("FETCH SELLER TICKETS ERROR:", error);
 
@@ -430,7 +419,6 @@ router.get("/:id", authenticateSeller, async (req, res) => {
       });
     }
 
-    // Check that this ticket belongs to the logged-in seller.
     const [tickets] = await pool.query(
       `SELECT
         id,
@@ -461,7 +449,6 @@ router.get("/:id", authenticateSeller, async (req, res) => {
 
     const ticket = tickets[0];
 
-    // Fetch original message and all replies from the same conversation.
     const [replies] = await pool.query(
       `SELECT
         id,
@@ -482,7 +469,6 @@ router.get("/:id", authenticateSeller, async (req, res) => {
       ticket,
       replies,
     });
-
   } catch (error) {
     console.error("FETCH TICKET CONVERSATION ERROR:", error);
 
@@ -492,6 +478,7 @@ router.get("/:id", authenticateSeller, async (req, res) => {
     });
   }
 });
+
 // ======================================================
 // SELLER REPLY TO TICKET
 // POST /api/tickets/:id/replies
@@ -500,7 +487,6 @@ router.get("/:id", authenticateSeller, async (req, res) => {
 router.post(
   "/:id/replies",
   authenticateSeller,
-
   (req, res, next) => {
     upload.single("attachment")(req, res, (error) => {
       if (error) {
@@ -513,7 +499,6 @@ router.post(
       next();
     });
   },
-
   async (req, res) => {
     let connection;
     let transactionStarted = false;
@@ -541,10 +526,10 @@ router.post(
       }
 
       connection = await pool.getConnection();
+
       await connection.beginTransaction();
       transactionStarted = true;
 
-      // Verify ticket ownership and status
       const [tickets] = await connection.query(
         `SELECT id, status
          FROM support_tickets
@@ -584,17 +569,16 @@ router.post(
         ? `uploads/${req.file.filename}`
         : null;
 
-      // Save seller reply in the same conversation table
       const [replyResult] = await connection.query(
         `INSERT INTO support_ticket_replies
-         (
-           ticket_id,
-           sender_type,
-           sender_id,
-           message,
-           attachment
-         )
-         VALUES (?, 'seller', ?, ?, ?)`,
+        (
+          ticket_id,
+          sender_type,
+          sender_id,
+          message,
+          attachment
+        )
+        VALUES (?, 'seller', ?, ?, ?)`,
         [
           ticket.id,
           req.sellerId,
@@ -626,7 +610,6 @@ router.post(
           createdAt: new Date(),
         },
       });
-
     } catch (error) {
       if (connection && transactionStarted) {
         try {
@@ -644,7 +627,6 @@ router.post(
         success: false,
         message: "Unable to send ticket reply.",
       });
-
     } finally {
       if (connection) {
         connection.release();
@@ -652,4 +634,90 @@ router.post(
     }
   }
 );
+
+// ======================================================
+// SELLER UPDATE TICKET STATUS
+// PATCH /api/tickets/:id/status
+// ======================================================
+
+router.patch("/:id/status", authenticateSeller, async (req, res) => {
+  try {
+    const ticketId = clean(req.params.id);
+    const status = clean(req.body.status).toLowerCase();
+
+    const allowedStatuses = [
+      "open",
+      "in_progress",
+      "waiting_for_seller",
+      "resolved",
+      "closed",
+    ];
+
+    if (!ticketId || !allowedStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid ticket ID or status.",
+      });
+    }
+
+    const [tickets] = await pool.query(
+      `SELECT id, ticket_number, status
+       FROM support_tickets
+       WHERE (ticket_number = ? OR id = ?)
+         AND seller_id = ?
+       LIMIT 1`,
+      [ticketId, ticketId, req.sellerId]
+    );
+
+    if (!tickets.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Ticket not found.",
+      });
+    }
+
+    const ticket = tickets[0];
+    const currentStatus = String(ticket.status || "").toLowerCase();
+
+    // A resolved/closed ticket can only be reopened to open.
+    if (
+      ["closed", "resolved"].includes(currentStatus) &&
+      status !== "open"
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Reopen the ticket before changing its status.",
+      });
+    }
+
+    await pool.query(
+      `UPDATE support_tickets
+       SET status = ?, updated_at = NOW()
+       WHERE id = ? AND seller_id = ?`,
+      [status, ticket.id, req.sellerId]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Ticket status updated successfully.",
+      ticket: {
+        id: ticket.id,
+        ticketNumber: ticket.ticket_number,
+        status,
+      },
+    });
+  } catch (error) {
+    console.error("SELLER TICKET STATUS UPDATE ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to update ticket status.",
+    });
+  }
+});
+
+// ======================================================
+// EXPORT ROUTER
+// ======================================================
+
 module.exports = router;
