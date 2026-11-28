@@ -1611,7 +1611,41 @@ router.patch(
   })
 );
 
+// GET CALL SUPPORT BOOKING DETAILS
+router.get(
+  "/call-support/bookings/:id",
+  verifyAdmin,
+  csWrap(async (req, res) => {
+    const id = Number(req.params.id);
 
+    if (!Number.isInteger(id) || id <= 0) {
+      return csFail(res, 400, "Invalid booking ID.");
+    }
+
+    const [rows] = await pool.query(
+      `SELECT
+        b.*,
+        ${CS_S_CODE} AS seller_code,
+        ${CS_S_NAME} AS seller_name,
+        ${CS_S_PHONE} AS seller_phone,
+        s.email AS seller_email,
+        m.name AS manager_name,
+        m.phone AS manager_phone
+       FROM support_bookings b
+       LEFT JOIN sellers s ON s.id = b.seller_id
+       LEFT JOIN support_managers m ON m.id = b.manager_id
+       WHERE b.id = ?
+       LIMIT 1`,
+      [id]
+    );
+
+    if (!rows.length) {
+      return csFail(res, 404, "Booking not found.");
+    }
+
+    csOk(res, { booking: rows[0] });
+  })
+);
 // PATCH booking status: Confirmed -> Completed / Cancelled
 router.patch(
   "/call-support/bookings/:id/status",
