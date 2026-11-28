@@ -185,6 +185,57 @@ async function verifySeller(sellerId) {
 }
 
 // =====================================================
+// GET LOGGED-IN SELLER PROFILE
+// GET /api/call-support/profile
+// =====================================================
+
+router.get("/profile", async (req, res) => {
+    try {
+        const [rows] = await pool.query(
+            `SELECT
+                id,
+                enrollmentNumber,
+                fullName,
+                mobile,
+                email
+             FROM sellers
+             WHERE id = ?
+             LIMIT 1`,
+            [req.sellerId]
+        );
+
+        if (!rows.length) {
+            return res.status(404).json({
+                success: false,
+                message: "Seller profile not found."
+            });
+        }
+
+        const seller = rows[0];
+
+        return res.json({
+            success: true,
+            seller: {
+                id: seller.id,
+                seller_id: seller.id,
+                enrollmentNumber: seller.enrollmentNumber || "",
+                name: seller.fullName || "",
+                mobile: seller.mobile || "",
+                email: seller.email || ""
+            }
+        });
+
+    } catch (error) {
+        console.error("Seller Profile API:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Unable to load seller profile."
+        });
+    }
+});
+
+// =====================================================
 // GET MANAGER DETAILS
 // GET /api/call-support/manager
 // =====================================================
@@ -298,6 +349,12 @@ router.get("/slots", async (req, res) => {
 // =====================================================
 // CREATE BOOKING
 // POST /api/call-support/bookings
+// Body:
+// {
+//   "slot_id": 123,
+//   "support_type": "Business Guidance",
+//   "problem_description": "I need help with my business."
+// }
 // =====================================================
 
 router.post("/bookings", async (req, res) => {
@@ -305,12 +362,55 @@ router.post("/bookings", async (req, res) => {
 
     try {
         const sellerId = req.sellerId;
-        const { slot_id, support_type } = req.body;
 
-        if (!slot_id || !support_type || !String(support_type).trim()) {
+        const {
+            slot_id,
+            support_type,
+            problem_description
+        } = req.body || {};
+
+        const description = String(
+            problem_description || ""
+        ).trim();
+
+        const supportType = String(
+            support_type || ""
+        ).trim();
+
+        const slotId = Number(slot_id);
+
+        if (!Number.isInteger(slotId) || slotId <= 0) {
             return res.status(400).json({
                 success: false,
-                message: "Slot and support type are required."
+                message: "Please select a valid time slot."
+            });
+        }
+
+        if (!supportType) {
+            return res.status(400).json({
+                success: false,
+                message: "Support type is required."
+            });
+        }
+
+        if (supportType.length > 100) {
+            return res.status(400).json({
+                success: false,
+                message: "Support type is too long."
+            });
+        }
+
+        if (!description) {
+            return res.status(400).json({
+                success: false,
+                message: "Please describe your problem."
+            });
+        }
+
+        if (description.length > 2000) {
+            return res.status(400).json({
+                success: false,
+                message: "Problem description maximum 2000 characters ki ho sakti hai."
             });
         }
 
@@ -330,7 +430,7 @@ router.post("/bookings", async (req, res) => {
              FROM support_slots
              WHERE id = ?
              FOR UPDATE`,
-            [slot_id]
+            [slotId]
         );
 
         const slot = slotRows[0];
@@ -341,6 +441,15 @@ router.post("/bookings", async (req, res) => {
             return res.status(409).json({
                 success: false,
                 message: "This slot is no longer available. Please select another slot."
+            });
+        }
+
+        if (String(slot.slot_date) < localToday()) {
+            await connection.rollback();
+
+            return res.status(400).json({
+                success: false,
+                message: "Past date slots cannot be booked."
             });
         }
 
@@ -394,9 +503,19 @@ router.post("/bookings", async (req, res) => {
 
         const [bookingResult] = await connection.query(
             `INSERT INTO support_bookings
-             (booking_reference, seller_id, manager_id, slot_id,
-              booking_date, start_time, end_time, support_type, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Confirmed')`,
+             (
+                booking_reference,
+                seller_id,
+                manager_id,
+                slot_id,
+                booking_date,
+                start_time,
+                end_time,
+                support_type,
+                problem_description,
+                status
+             )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Confirmed')`,
             [
                 reference,
                 sellerId,
@@ -405,7 +524,8 @@ router.post("/bookings", async (req, res) => {
                 slot.slot_date,
                 slot.start_time,
                 slot.end_time,
-                String(support_type).trim()
+                supportType,
+                description
             ]
         );
 
@@ -420,7 +540,8 @@ router.post("/bookings", async (req, res) => {
                 booking_date: slot.slot_date,
                 start_time: slot.start_time,
                 end_time: slot.end_time,
-                support_type: String(support_type).trim(),
+                support_type: supportType,
+                problem_description: description,
                 status: "Confirmed",
                 manager
             }
@@ -465,6 +586,7 @@ router.get("/bookings", async (req, res) => {
                 b.start_time,
                 b.end_time,
                 b.support_type,
+                b.problem_description,
                 b.status,
                 b.created_at,
                 m.name AS manager_name,
@@ -571,6 +693,15 @@ router.patch("/bookings/:id/reschedule", async (req, res) => {
             return res.status(409).json({
                 success: false,
                 message: "The selected slot is not available."
+            });
+        }
+
+        if (String(newSlot.slot_date) < localToday()) {
+            await connection.rollback();
+
+            return res.status(400).json({
+                success: false,
+                message: "Past date slots cannot be selected."
             });
         }
 
@@ -783,5 +914,56 @@ router.get("/stats", async (req, res) => {
         });
     }
 });
+// ======================================================
+// GET LOGGED-IN SELLER PROFILE
+// GET /api/call-support/profile
+// ======================================================
+router.get("/profile", async (req, res) => {
+  try {
+    const sellerId = req.sellerId;
 
+    if (!sellerId) {
+      return res.status(401).json({
+        success: false,
+        message: "Seller login required",
+      });
+    }
+
+    const [rows] = await pool.query(
+      `SELECT id, enrollmentNumber, fullName, mobile, email
+       FROM sellers
+       WHERE id = ?
+       LIMIT 1`,
+      [sellerId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Seller profile not found",
+      });
+    }
+
+    const seller = rows[0];
+
+    return res.json({
+      success: true,
+      seller: {
+        id: seller.id,
+        seller_id: seller.id,
+        enrollmentNumber: seller.enrollmentNumber || "",
+        name: seller.fullName || "",
+        mobile: seller.mobile || "",
+        email: seller.email || "",
+      },
+    });
+  } catch (error) {
+    console.error("CALL SUPPORT PROFILE ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch seller profile",
+    });
+  }
+});
 module.exports = router;

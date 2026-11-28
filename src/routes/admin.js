@@ -1160,5 +1160,428 @@ router.post(
     }
   }
 );
+// ======================================================
+// CALL SUPPORT - ADMIN
+// GET   /admin/call-support/managers
+// GET   /admin/call-support/stats
+// GET   /admin/call-support/calendar?month=YYYY-MM
+// GET   /admin/call-support/slots-summary?date=YYYY-MM-DD
+// GET   /admin/call-support/slots?date=YYYY-MM-DD&manager=ID
+// GET   /admin/call-support/bookings
+// POST  /admin/call-support/bookings
+// PATCH /admin/call-support/bookings/:id/status
+//
+// Tables: support_bookings, support_slots, support_managers, sellers
+// (PASTE THIS BLOCK just above `module.exports = router;`)
+// ======================================================
 
+const CS_ISO = /^\d{4}-\d{2}-\d{2}$/;
+const CS_STATUSES = ["Confirmed", "Completed", "Cancelled"];
+
+// sellers table columns
+const CS_S_NAME = "s.fullName";
+const CS_S_PHONE = "s.mobile";
+const CS_S_PHOTO = "NULL"; // photo URL column ho to e.g. s.profilePhoto
+const CS_S_CODE = "COALESCE(NULLIF(s.enrollmentNumber, ''), CONCAT('SLR-', s.id))";
+
+const csOk = (res, data = {}) => res.json({ success: true, ...data });
+const csFail = (res, code, message) =>
+  res.status(code).json({ success: false, message });
+const csWrap = (fn) => (req, res) =>
+  fn(req, res).catch((error) => {
+    console.error("ADMIN CALL SUPPORT ERROR:", error);
+    csFail(res, 500, "Server error");
+  });
+
+function csToday() {
+  const n = new Date();
+  return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, "0")}-${String(n.getDate()).padStart(2, "0")}`;
+}
+
+function csWorkingDay(dateString, workingDays) {
+  const day = new Date(`${dateString}T12:00:00`).getDay();
+  const days = String(workingDays || "Monday-Saturday").toLowerCase();
+  if (days.includes("monday-friday")) return day >= 1 && day <= 5;
+  return day >= 1 && day <= 6;
+}
+
+const csToMin = (t) => {
+  const p = String(t).slice(0, 8).split(":");
+  return Number(p[0]) * 60 + Number(p[1]);
+};
+const csToTime = (m) =>
+  `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}:00`;
+
+// seller wale router jaisa slot generation (30 min)
+async function csGenerateSlots(date, manager) {
+  const [existing] = await pool.query(
+    "SELECT id FROM support_slots WHERE manager_id = ? AND slot_date = ? LIMIT 1",
+    [manager.id, date]
+  );
+  if (existing.length || !csWorkingDay(date, manager.working_days)) return;
+
+  const start = csToMin(manager.start_time);
+  const end = csToMin(manager.end_time);
+  const values = [];
+
+  for (let m = start; m + 30 <= end; m += 30) {
+    values.push([manager.id, date, csToTime(m), csToTime(m + 30)]);
+  }
+
+  if (values.length) {
+    await pool.query(
+      "INSERT IGNORE INTO support_slots (manager_id, slot_date, start_time, end_time) VALUES ?",
+      [values]
+    );
+  }
+}
+
+// GET managers
+router.get(
+  "/call-support/managers",
+  verifyAdmin,
+  csWrap(async (req, res) => {
+    const [managers] = await pool.query(
+      "SELECT id, name, phone FROM support_managers WHERE is_active = 1 ORDER BY name"
+    );
+    csOk(res, { managers });
+  })
+);
+
+// GET stats (last 30 days vs previous 30)
+router.get(
+  "/call-support/stats",
+  verifyAdmin,
+  csWrap(async (req, res) => {
+    const cur = "created_at >= NOW() - INTERVAL 30 DAY";
+    const prev =
+      "created_at < NOW() - INTERVAL 30 DAY AND created_at >= NOW() - INTERVAL 60 DAY";
+    const UP = "(status = 'Confirmed' AND booking_date >= CURDATE())";
+
+    const [[r]] = await pool.query(`
+      SELECT
+        COUNT(*) total,
+        COALESCE(SUM(status = 'Completed'), 0) completed,
+        COALESCE(SUM(${UP}), 0) upcoming,
+        COALESCE(SUM(status = 'Cancelled'), 0) cancelled,
+        COALESCE(SUM(${cur}), 0) c_total,
+        COALESCE(SUM(${prev}), 0) p_total,
+        COALESCE(SUM(status = 'Completed' AND ${cur}), 0) c_completed,
+        COALESCE(SUM(status = 'Completed' AND ${prev}), 0) p_completed,
+        COALESCE(SUM(${UP} AND ${cur}), 0) c_upcoming,
+        COALESCE(SUM(${UP} AND ${prev}), 0) p_upcoming,
+        COALESCE(SUM(status = 'Cancelled' AND ${cur}), 0) c_cancelled,
+        COALESCE(SUM(status = 'Cancelled' AND ${prev}), 0) p_cancelled
+      FROM support_bookings`);
+
+    const pct = (c, p) => {
+      c = Number(c);
+      p = Number(p);
+      return !p ? (c ? null : 0) : Math.round(((c - p) / p) * 100);
+    };
+
+    csOk(res, {
+      stats: {
+        total: { value: Number(r.total), delta: pct(r.c_total, r.p_total) },
+        completed: { value: Number(r.completed), delta: pct(r.c_completed, r.p_completed) },
+        upcoming: { value: Number(r.upcoming), delta: pct(r.c_upcoming, r.p_upcoming) },
+        cancelled: { value: Number(r.cancelled), delta: pct(r.c_cancelled, r.p_cancelled) },
+      },
+    });
+  })
+);
+
+// GET calendar: booked dates of a month
+router.get(
+  "/call-support/calendar",
+  verifyAdmin,
+  csWrap(async (req, res) => {
+    const month = String(req.query.month || "");
+    if (!/^\d{4}-\d{2}$/.test(month)) return csFail(res, 400, "Invalid month");
+
+    const [rows] = await pool.query(
+      `SELECT DISTINCT DATE_FORMAT(booking_date, '%Y-%m-%d') d
+       FROM support_bookings
+       WHERE DATE_FORMAT(booking_date, '%Y-%m') = ?
+         AND status <> 'Cancelled'`,
+      [month]
+    );
+    csOk(res, { dates: rows.map((x) => x.d) });
+  })
+);
+
+// GET slot summary of a date
+router.get(
+  "/call-support/slots-summary",
+  verifyAdmin,
+  csWrap(async (req, res) => {
+    const date = CS_ISO.test(req.query.date || "") ? req.query.date : csToday();
+
+    if (date >= csToday()) {
+      const [managers] = await pool.query(
+        `SELECT id, working_days, start_time, end_time
+         FROM support_managers WHERE is_active = 1`
+      );
+      for (const m of managers) await csGenerateSlots(date, m);
+    }
+
+    const [[r]] = await pool.query(
+      `SELECT COUNT(*) total,
+              COALESCE(SUM(sl.is_available = 0), 0) booked,
+              COALESCE(SUM(sl.is_available = 1
+                AND (sl.slot_date > CURDATE() OR sl.start_time > CURTIME())), 0) available
+       FROM support_slots sl
+       JOIN support_managers m ON m.id = sl.manager_id AND m.is_active = 1
+       WHERE sl.slot_date = ?`,
+      [date]
+    );
+
+    csOk(res, {
+      total: Number(r.total),
+      booked: Number(r.booked),
+      available: Number(r.available),
+    });
+  })
+);
+
+// GET slots of a manager on a date (manual booking)
+router.get(
+  "/call-support/slots",
+  verifyAdmin,
+  csWrap(async (req, res) => {
+    const date = req.query.date;
+    if (!CS_ISO.test(date || "") || date < csToday()) {
+      return csFail(res, 400, "Please select a valid current or future date.");
+    }
+
+    const [[manager]] = await pool.query(
+      `SELECT id, working_days, start_time, end_time
+       FROM support_managers WHERE id = ? AND is_active = 1`,
+      [Number(req.query.manager)]
+    );
+    if (!manager) return csFail(res, 404, "Manager not found.");
+
+    if (!csWorkingDay(date, manager.working_days)) {
+      return csOk(res, { slots: [], message: "Support is not available on this day." });
+    }
+
+    await csGenerateSlots(date, manager);
+
+    const [slots] = await pool.query(
+      `SELECT id,
+              TIME_FORMAT(start_time, '%H:%i:%s') AS start_time,
+              TIME_FORMAT(end_time, '%H:%i:%s') AS end_time,
+              is_available
+       FROM support_slots
+       WHERE manager_id = ? AND slot_date = ?
+       ORDER BY start_time ASC`,
+      [manager.id, date]
+    );
+
+    const now = new Date();
+    const nowMin = now.getHours() * 60 + now.getMinutes();
+
+    csOk(res, {
+      slots: slots.map((s) => ({
+        ...s,
+        is_available:
+          Boolean(s.is_available) &&
+          !(date === csToday() && csToMin(s.start_time) <= nowMin),
+      })),
+    });
+  })
+);
+
+// GET bookings (filters + pagination)
+router.get(
+  "/call-support/bookings",
+  verifyAdmin,
+  csWrap(async (req, res) => {
+    const q = req.query;
+    const where = ["1 = 1"];
+    const params = [];
+
+    if (q.tab === "upcoming") where.push("(b.status = 'Confirmed' AND b.booking_date >= CURDATE())");
+    else if (q.tab === "completed") where.push("b.status = 'Completed'");
+    else if (q.tab === "cancelled") where.push("b.status = 'Cancelled'");
+
+    if (CS_STATUSES.includes(q.status)) {
+      where.push("b.status = ?");
+      params.push(q.status);
+    }
+    if (q.manager) {
+      where.push("b.manager_id = ?");
+      params.push(Number(q.manager));
+    }
+    if (CS_ISO.test(q.date || "")) {
+      where.push("b.booking_date = ?");
+      params.push(q.date);
+    } else {
+      if (CS_ISO.test(q.from || "")) { where.push("b.booking_date >= ?"); params.push(q.from); }
+      if (CS_ISO.test(q.to || "")) { where.push("b.booking_date <= ?"); params.push(q.to); }
+    }
+    if (q.q && String(q.q).trim()) {
+      const like = `%${String(q.q).trim()}%`;
+      where.push(`(${CS_S_NAME} LIKE ? OR ${CS_S_PHONE} LIKE ? OR s.email LIKE ?
+                   OR s.enrollmentNumber LIKE ? OR b.booking_reference LIKE ?)`);
+      params.push(like, like, like, like, like);
+    }
+
+    const limit = Math.min(Math.max(parseInt(q.limit, 10) || 10, 1), 100);
+    const page = Math.max(parseInt(q.page, 10) || 1, 1);
+    const W = where.join(" AND ");
+    const FROM = `FROM support_bookings b
+                  JOIN sellers s ON s.id = b.seller_id
+                  LEFT JOIN support_managers m ON m.id = b.manager_id`;
+
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(*) total ${FROM} WHERE ${W}`, params
+    );
+
+    const [rows] = await pool.query(
+      `SELECT b.id, b.booking_reference, b.seller_id,
+              ${CS_S_CODE} AS seller_code,
+              ${CS_S_NAME} AS seller_name,
+              ${CS_S_PHONE} AS seller_phone,
+              ${CS_S_PHOTO} AS seller_photo,
+              b.manager_id, m.name AS manager_name, m.phone AS manager_phone,
+              DATE_FORMAT(b.booking_date, '%Y-%m-%d') AS booking_date,
+              TIME_FORMAT(b.start_time, '%H:%i:%s') AS start_time,
+              TIME_FORMAT(b.end_time, '%H:%i:%s') AS end_time,
+              b.support_type, b.status
+       ${FROM}
+       WHERE ${W}
+       ORDER BY b.booking_date DESC, b.start_time DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, (page - 1) * limit]
+    );
+
+    csOk(res, { rows, total: Number(total) });
+  })
+);
+
+// POST manual booking (admin books a slot for a seller)
+router.post(
+  "/call-support/bookings",
+  verifyAdmin,
+  csWrap(async (req, res) => {
+    const { seller, slot_id, support_type } = req.body || {};
+    const slotId = Number(slot_id);
+    const type = String(support_type || "").trim();
+    const sellerText = String(seller || "").trim();
+
+    if (!sellerText) return csFail(res, 400, "Seller ID / enrollment number required.");
+    if (!slotId || !type) return csFail(res, 400, "Slot and support type are required.");
+
+    // "SLR-12" / "12" => seller id, ya enrollment number
+    const idMatch = sellerText.match(/^(?:SLR-)?(\d+)$/i);
+    const [[s]] = await pool.query(
+      "SELECT id FROM sellers WHERE enrollmentNumber = ? OR id = ? LIMIT 1",
+      [sellerText, idMatch ? Number(idMatch[1]) : 0]
+    );
+    if (!s) return csFail(res, 404, "Seller not found.");
+
+    const connection = await pool.getConnection();
+
+    try {
+      await connection.beginTransaction();
+
+      const [slotRows] = await connection.query(
+        "SELECT * FROM support_slots WHERE id = ? FOR UPDATE", [slotId]
+      );
+      const slot = slotRows[0];
+
+      if (!slot || !slot.is_available) {
+        await connection.rollback();
+        return csFail(res, 409, "This slot is no longer available.");
+      }
+
+      const [upd] = await connection.query(
+        "UPDATE support_slots SET is_available = 0 WHERE id = ? AND is_available = 1",
+        [slot.id]
+      );
+      if (upd.affectedRows !== 1) {
+        await connection.rollback();
+        return csFail(res, 409, "This slot has just been booked.");
+      }
+
+      const reference = "CS" + Date.now() + Math.floor(1000 + Math.random() * 9000);
+
+      const [r] = await connection.query(
+        `INSERT INTO support_bookings
+           (booking_reference, seller_id, manager_id, slot_id,
+            booking_date, start_time, end_time, support_type, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Confirmed')`,
+        [reference, s.id, slot.manager_id, slot.id,
+         slot.slot_date, slot.start_time, slot.end_time, type]
+      );
+
+      await connection.commit();
+      csOk(res, { id: r.insertId, booking_reference: reference });
+    } catch (error) {
+      await connection.rollback();
+      if (error.code === "ER_DUP_ENTRY") {
+        return csFail(res, 409, "This slot is already booked.");
+      }
+      throw error;
+    } finally {
+      connection.release();
+    }
+  })
+);
+
+// PATCH booking status: Confirmed -> Completed / Cancelled
+router.patch(
+  "/call-support/bookings/:id/status",
+  verifyAdmin,
+  csWrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const status = req.body && req.body.status;
+
+    if (!Number.isInteger(id) || id <= 0) return csFail(res, 400, "Invalid booking ID.");
+    if (!["Completed", "Cancelled"].includes(status)) {
+      return csFail(res, 400, "Status must be Completed or Cancelled.");
+    }
+
+    const connection = await pool.getConnection();
+
+    try {
+      await connection.beginTransaction();
+
+      const [rows] = await connection.query(
+        "SELECT * FROM support_bookings WHERE id = ? FOR UPDATE", [id]
+      );
+      const booking = rows[0];
+
+      if (!booking) {
+        await connection.rollback();
+        return csFail(res, 404, "Booking not found.");
+      }
+      if (booking.status !== "Confirmed") {
+        await connection.rollback();
+        return csFail(res, 400, "Only confirmed bookings can be updated.");
+      }
+
+      await connection.query(
+        "UPDATE support_bookings SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [status, id]
+      );
+
+      if (status === "Cancelled") {
+        await connection.query(
+          "UPDATE support_slots SET is_available = 1 WHERE id = ?",
+          [booking.slot_id]
+        );
+      }
+
+      await connection.commit();
+      csOk(res, { message: `Booking ${status.toLowerCase()}.` });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  })
+);
 module.exports = router;

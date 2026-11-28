@@ -93,8 +93,21 @@ console.log(
 app.use("/api", usersRouter);
 
 // Admin
-//app.use("/admin", require("./src/routes/admin"));
-app.use("/admin", require("./src/routes/admin"));
+//a// Admin Routes
+const adminRouter = require("./src/routes/admin");
+
+console.log(
+  "[ADMIN CALL SUPPORT ROUTES]",
+  adminRouter.stack
+    .filter((layer) => layer.route && layer.route.path.includes("call-support"))
+    .map((layer) => ({
+      path: layer.route.path,
+      methods: Object.keys(layer.route.methods),
+    }))
+);
+
+app.use("/admin", adminRouter);
+app.use("/api/admin", adminRouter);
 app.use("/api/admin", require("./src/routes/admin"));
 //app.use("SellerApi", require("./src/routes/SellerApi"));
 
