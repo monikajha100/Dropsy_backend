@@ -1530,6 +1530,88 @@ router.post(
   })
 );
 
+// ======================================================
+// CALL SUPPORT - BOOKING DETAILS
+// GET /admin/call-support/bookings/:id
+// PATCH /admin/call-support/bookings/:id/note
+// ======================================================
+
+// GET COMPLETE BOOKING DETAILS
+router.get(
+  "/call-support/bookings/:id",
+  verifyAdmin,
+  csWrap(async (req, res) => {
+    const id = Number(req.params.id);
+
+    if (!Number.isInteger(id) || id <= 0) {
+      return csFail(res, 400, "Invalid booking ID.");
+    }
+
+    const [rows] = await pool.query(
+      `SELECT
+          b.*,
+          ${CS_S_CODE} AS seller_code,
+          ${CS_S_NAME} AS seller_name,
+          ${CS_S_PHONE} AS seller_phone,
+          s.email AS seller_email,
+          ${CS_S_PHOTO} AS seller_photo,
+          m.name AS manager_name,
+          m.phone AS manager_phone
+       FROM support_bookings b
+       LEFT JOIN sellers s ON s.id = b.seller_id
+       LEFT JOIN support_managers m ON m.id = b.manager_id
+       WHERE b.id = ?
+       LIMIT 1`,
+      [id]
+    );
+
+    if (!rows.length) {
+      return csFail(res, 404, "Booking not found.");
+    }
+
+    const booking = rows[0];
+
+    csOk(res, { booking });
+  })
+);
+
+
+// SAVE ADMIN NOTE
+router.patch(
+  "/call-support/bookings/:id/note",
+  verifyAdmin,
+  csWrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const note = String(req.body?.admin_note || "").trim();
+
+    if (!Number.isInteger(id) || id <= 0) {
+      return csFail(res, 400, "Invalid booking ID.");
+    }
+
+    if (note.length > 500) {
+      return csFail(res, 400, "Note cannot exceed 500 characters.");
+    }
+
+    const [result] = await pool.query(
+      `UPDATE support_bookings
+       SET admin_note = ?,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [note || null, id]
+    );
+
+    if (!result.affectedRows) {
+      return csFail(res, 404, "Booking not found.");
+    }
+
+    csOk(res, {
+      message: "Admin note saved successfully.",
+      admin_note: note,
+    });
+  })
+);
+
+
 // PATCH booking status: Confirmed -> Completed / Cancelled
 router.patch(
   "/call-support/bookings/:id/status",
