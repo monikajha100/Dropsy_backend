@@ -1,61 +1,62 @@
 
 const express = require("express");
-const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 const pool = require("./pool");
 
 const router = express.Router();
 
 // =====================================================
-// AUTHENTICATION
+// SELLER SESSION AUTHENTICATION
 // =====================================================
 
-function authenticateSeller(req, res, next) {
+async function authenticateSeller(req, res, next) {
     try {
         const authHeader = req.headers.authorization || "";
-        const token = authHeader.startsWith("Bearer ")
-            ? authHeader.slice(7)
-            : null;
+        const match = authHeader.match(/^Bearer\s+([a-f0-9]{64})$/i);
 
-        if (!token) {
+        if (!match) {
             return res.status(401).json({
                 success: false,
                 message: "Please login first."
             });
         }
 
-        if (!process.env.JWT_SECRET) {
-            console.error("JWT_SECRET is missing in environment.");
-            return res.status(500).json({
-                success: false,
-                message: "Server authentication is not configured."
-            });
-        }
+        const token = match[1];
 
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const tokenHash = crypto
+            .createHash("sha256")
+            .update(token)
+            .digest("hex");
 
-        // These IDs must be claims inside your signed seller JWT.
-        const sellerId = Number(
-            decoded.seller_id ||
-            decoded.sellerId ||
-            decoded.id ||
-            decoded.seller?.id ||
-            decoded.user?.seller_id
+        const [sessions] = await pool.query(
+            `SELECT id, seller_id
+             FROM seller_login_sessions
+             WHERE session_token = ?
+               AND expires_at > NOW()
+               AND status = 'active'
+             LIMIT 1`,
+            [tokenHash]
         );
 
-        if (!Number.isInteger(sellerId) || sellerId <= 0) {
+        if (!sessions.length) {
             return res.status(401).json({
                 success: false,
-                message: "Invalid seller login token."
+                message: "Seller session expired. Please login again."
             });
         }
 
-        req.sellerId = sellerId;
+        req.sellerId = Number(sessions[0].seller_id);
+        req.sessionId = sessions[0].id;
+        req.sessionTokenHash = tokenHash;
+
         next();
 
     } catch (error) {
-        return res.status(401).json({
+        console.error("Call Support Authentication:", error);
+
+        return res.status(500).json({
             success: false,
-            message: "Session expired. Please login again."
+            message: "Authentication failed."
         });
     }
 }
@@ -72,6 +73,7 @@ function validDate(value) {
     }
 
     const date = new Date(`${value}T00:00:00`);
+
     return !Number.isNaN(date.getTime()) &&
         date.toISOString().slice(0, 10) === value;
 }
@@ -96,12 +98,14 @@ function isWorkingDay(dateString, workingDays) {
 
 function timeToMinutes(time) {
     const parts = String(time).slice(0, 8).split(":");
+
     return Number(parts[0]) * 60 + Number(parts[1]);
 }
 
 function minutesToTime(minutes) {
     const hours = String(Math.floor(minutes / 60)).padStart(2, "0");
     const mins = String(minutes % 60).padStart(2, "0");
+
     return `${hours}:${mins}:00`;
 }
 
@@ -110,6 +114,7 @@ function localToday() {
     const year = now.getFullYear();
     const month = String(now.getMonth() + 1).padStart(2, "0");
     const day = String(now.getDate()).padStart(2, "0");
+
     return `${year}-${month}-${day}`;
 }
 
@@ -147,7 +152,11 @@ async function generateSlots(date, manager) {
 
     const values = [];
 
-    for (let minute = start; minute + duration <= end; minute += duration) {
+    for (
+        let minute = start;
+        minute + duration <= end;
+        minute += duration
+    ) {
         values.push([
             manager.id,
             date,
@@ -191,14 +200,15 @@ router.get("/manager", async (req, res) => {
             });
         }
 
-        res.json({
+        return res.json({
             success: true,
             manager
         });
 
     } catch (error) {
         console.error("Manager API:", error);
-        res.status(500).json({
+
+        return res.status(500).json({
             success: false,
             message: "Unable to load support manager."
         });
@@ -268,7 +278,7 @@ router.get("/slots", async (req, res) => {
             };
         });
 
-        res.json({
+        return res.json({
             success: true,
             date,
             manager_id: manager.id,
@@ -277,7 +287,8 @@ router.get("/slots", async (req, res) => {
 
     } catch (error) {
         console.error("Slots API:", error);
-        res.status(500).json({
+
+        return res.status(500).json({
             success: false,
             message: "Unable to load available slots."
         });
@@ -290,7 +301,7 @@ router.get("/slots", async (req, res) => {
 // =====================================================
 
 router.post("/bookings", async (req, res) => {
-    const connection = await pool.getConnection();
+    let connection;
 
     try {
         const sellerId = req.sellerId;
@@ -309,6 +320,8 @@ router.post("/bookings", async (req, res) => {
                 message: "Seller account was not found."
             });
         }
+
+        connection = await pool.getConnection();
 
         await connection.beginTransaction();
 
@@ -398,7 +411,7 @@ router.post("/bookings", async (req, res) => {
 
         await connection.commit();
 
-        res.status(201).json({
+        return res.status(201).json({
             success: true,
             message: "Your support call has been confirmed.",
             booking: {
@@ -414,7 +427,9 @@ router.post("/bookings", async (req, res) => {
         });
 
     } catch (error) {
-        await connection.rollback();
+        if (connection) {
+            await connection.rollback();
+        }
 
         console.error("Create booking API:", error);
 
@@ -425,13 +440,13 @@ router.post("/bookings", async (req, res) => {
             });
         }
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             message: "Unable to create booking."
         });
 
     } finally {
-        connection.release();
+        if (connection) connection.release();
     }
 });
 
@@ -461,14 +476,15 @@ router.get("/bookings", async (req, res) => {
             [req.sellerId]
         );
 
-        res.json({
+        return res.json({
             success: true,
             bookings
         });
 
     } catch (error) {
         console.error("Bookings API:", error);
-        res.status(500).json({
+
+        return res.status(500).json({
             success: false,
             message: "Unable to load bookings."
         });
@@ -482,19 +498,23 @@ router.get("/bookings", async (req, res) => {
 // =====================================================
 
 router.patch("/bookings/:id/reschedule", async (req, res) => {
-    const connection = await pool.getConnection();
+    let connection;
 
     try {
         const bookingId = Number(req.params.id);
         const newSlotId = Number(req.body.slot_id);
 
-        if (!Number.isInteger(bookingId) || bookingId <= 0 ||
-            !Number.isInteger(newSlotId) || newSlotId <= 0) {
+        if (
+            !Number.isInteger(bookingId) || bookingId <= 0 ||
+            !Number.isInteger(newSlotId) || newSlotId <= 0
+        ) {
             return res.status(400).json({
                 success: false,
                 message: "Valid booking ID and new slot ID are required."
             });
         }
+
+        connection = await pool.getConnection();
 
         await connection.beginTransaction();
 
@@ -606,7 +626,7 @@ router.patch("/bookings/:id/reschedule", async (req, res) => {
 
         await connection.commit();
 
-        res.json({
+        return res.json({
             success: true,
             message: "Your support call has been rescheduled.",
             booking: {
@@ -619,16 +639,19 @@ router.patch("/bookings/:id/reschedule", async (req, res) => {
         });
 
     } catch (error) {
-        await connection.rollback();
+        if (connection) {
+            await connection.rollback();
+        }
+
         console.error("Reschedule API:", error);
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             message: "Unable to reschedule booking."
         });
 
     } finally {
-        connection.release();
+        if (connection) connection.release();
     }
 });
 
@@ -638,7 +661,7 @@ router.patch("/bookings/:id/reschedule", async (req, res) => {
 // =====================================================
 
 router.patch("/bookings/:id/cancel", async (req, res) => {
-    const connection = await pool.getConnection();
+    let connection;
 
     try {
         const bookingId = Number(req.params.id);
@@ -649,6 +672,8 @@ router.patch("/bookings/:id/cancel", async (req, res) => {
                 message: "Invalid booking ID."
             });
         }
+
+        connection = await pool.getConnection();
 
         await connection.beginTransaction();
 
@@ -697,22 +722,25 @@ router.patch("/bookings/:id/cancel", async (req, res) => {
 
         await connection.commit();
 
-        res.json({
+        return res.json({
             success: true,
             message: "Your support call has been cancelled."
         });
 
     } catch (error) {
-        await connection.rollback();
+        if (connection) {
+            await connection.rollback();
+        }
+
         console.error("Cancel booking API:", error);
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             message: "Unable to cancel booking."
         });
 
     } finally {
-        connection.release();
+        if (connection) connection.release();
     }
 });
 
@@ -735,7 +763,7 @@ router.get("/stats", async (req, res) => {
             [req.sellerId]
         );
 
-        res.json({
+        return res.json({
             success: true,
             stats: {
                 total: Number(rows[0].total_bookings || 0),
@@ -748,7 +776,8 @@ router.get("/stats", async (req, res) => {
 
     } catch (error) {
         console.error("Stats API:", error);
-        res.status(500).json({
+
+        return res.status(500).json({
             success: false,
             message: "Unable to load booking statistics."
         });
