@@ -90,7 +90,8 @@ console.log(
     }))
 );
 
-app.use("/api", usersRouter);
+// Team Management APIs
+app.use("/admin", usersRouter.teamRouter);
 
 // Admin
 //a// Admin Routes
