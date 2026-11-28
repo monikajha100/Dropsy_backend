@@ -7,6 +7,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
+const bcrypt = require("bcryptjs");
 
 const JWT_SECRET =
   process.env.JWT_SECRET || "DROPSHY_ADMIN_SECRET_2026";
