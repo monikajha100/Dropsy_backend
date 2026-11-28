@@ -73,7 +73,7 @@ app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 // Banner
 app.use("/api/banners", require("./src/routes/banner"));
-
+app.use("/api/call-support", require("./src/routes/callersupport"));
 // Blog
 app.use("/api", require("./src/routes/blog"));
 
