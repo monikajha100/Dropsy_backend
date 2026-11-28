@@ -4,7 +4,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
-const { ensureInvoice } = require("./src/routes/invoiceService");
+
 const app = express();
 
 // ======================================================
@@ -30,14 +30,17 @@ const corsOptions = {
     console.error("[CORS BLOCKED]", origin);
     return callback(new Error("Not allowed by CORS"));
   },
+
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+
   allowedHeaders: [
-  "Content-Type",
-  "Authorization",
-  "Accept",
-  "X-Requested-With",
-  "Origin",
-],
+    "Content-Type",
+    "Authorization",
+    "Accept",
+    "X-Requested-With",
+    "Origin",
+  ],
+
   credentials: true,
   optionsSuccessStatus: 204,
 };
@@ -71,14 +74,23 @@ app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 // ROUTES
 // ======================================================
 
-// Banner
+// ---------------- BANNER ----------------
+
 app.use("/api/banners", require("./src/routes/banner"));
-app.use("/api/call-support", require("./src/routes/callersupport"));// Blog
+
+// ---------------- CALL SUPPORT ----------------
+
+app.use("/api/call-support", require("./src/routes/callersupport"));
+
+// ---------------- BLOG ----------------
+
 app.use("/api", require("./src/routes/blog"));
 
-// Users
-// Users
+// ---------------- USERS ----------------
+
 const usersRouter = require("./src/routes/users");
+
+app.use("/api", usersRouter);
 
 console.log(
   "[USERS ROUTES LOADED]",
@@ -90,17 +102,18 @@ console.log(
     }))
 );
 
-// Team Management APIs
-app.use("/admin", usersRouter.teamRouter);
+// ---------------- ADMIN ----------------
 
-// Admin
-//a// Admin Routes
 const adminRouter = require("./src/routes/admin");
 
 console.log(
   "[ADMIN CALL SUPPORT ROUTES]",
   adminRouter.stack
-    .filter((layer) => layer.route && layer.route.path.includes("call-support"))
+    .filter(
+      (layer) =>
+        layer.route &&
+        String(layer.route.path).includes("call-support")
+    )
     .map((layer) => ({
       path: layer.route.path,
       methods: Object.keys(layer.route.methods),
@@ -109,42 +122,63 @@ console.log(
 
 app.use("/admin", adminRouter);
 app.use("/api/admin", adminRouter);
-app.use("/api/admin", require("./src/routes/admin"));
-//app.use("SellerApi", require("./src/routes/SellerApi"));
 
-// Seller
+// ---------------- SELLER ----------------
+
 app.use("/api/sellers", require("./src/routes/sellors"));
 
-// KYC
+// ---------------- KYC ----------------
+
 app.use("/api/kyc", require("./src/routes/kyc"));
 
-// Dashboard
+// ---------------- DASHBOARD ----------------
+
 app.use("/api/dashboard", require("./src/routes/dashboard"));
 
-// Orders
+// ---------------- ORDERS ----------------
+
 app.use("/api/order", require("./src/routes/order"));
 
-// Wallet
+// ---------------- WALLET ----------------
+
 app.use("/api/wallet", require("./src/routes/wallet"));
 
-// Payment
+// ---------------- PAYMENT ----------------
+
 app.use("/api/payment", require("./src/routes/payment"));
 
-// Product
+// ---------------- PRODUCT ----------------
+
 app.use("/api/product", require("./src/routes/product"));
 
-// GST Ledger
+// ---------------- GST LEDGER ----------------
+
 app.use("/api/gst-ledger", require("./src/routes/gstLedger"));
 
-// Categories
+// ---------------- CATEGORIES ----------------
+
 app.use("/api/categories", require("./src/routes/categories"));
-//app.use("/api/invoiceServices", require("./src/routes/invoiceService"));
-// Support Tickets
+
+// ---------------- SUPPORT TICKETS ----------------
+
 app.use("/api/tickets", require("./src/routes/tickets"));
-app.use("/api/seller-warehouses",require("./src/routes/sellerWarehouses"));
-// Seller Products
-app.use("/api/seller-products", require("./src/routes/sellerproduct"));
-// Vendors
+
+// ---------------- SELLER WAREHOUSES ----------------
+
+app.use(
+  "/api/seller-warehouses",
+  require("./src/routes/sellerWarehouses")
+);
+
+// ---------------- SELLER PRODUCTS ----------------
+
+app.use(
+  "/api/seller-products",
+  require("./src/routes/sellerproduct")
+);
+
+// ---------------- VENDORS ----------------
+
 app.use("/api/vendors", require("./src/routes/vendors"));
 
 // ======================================================
@@ -203,6 +237,8 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("--------------------------------------");
   console.log("DROPSHY BACKEND STARTED SUCCESSFULLY");
   console.log(`PORT: ${PORT}`);
+  console.log("USERS API: /api/users");
+  console.log("ADMIN API: /admin and /api/admin");
   console.log("SELLER API: /api/sellers");
   console.log("KYC API: /api/kyc");
   console.log("WALLET API: /api/wallet");
