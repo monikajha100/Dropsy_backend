@@ -4,6 +4,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const pool = require("./pool");
 
+const router = express.Router();
 const teamRouter = express.Router();
 
 const JWT_SECRET =
